@@ -28,20 +28,30 @@ def parse_netlist(file):
     lines = file.read().decode("utf-8").splitlines()
     components = []
     capture = False
+    comp = {}
     for line in lines:
-        if line.strip() == "(components":
+        line = line.strip()
+        if line == "(components":
             capture = True
-        elif line.strip() == ")" and capture:
+        elif line == ")" and capture:
             break
         elif capture:
-            if line.strip().startswith("(comp"):
+            if line.startswith("(comp"):
                 comp = {}
-            elif line.strip().startswith("(ref"):
-                comp["Component"] = line.strip().split()[1].replace(")", "")
-            elif line.strip().startswith("(value"):
-                comp["Value"] = line.strip().split()[1].replace(")", "")
-            elif line.strip().startswith("(footprint"):
-                comp["Footprint"] = line.strip().split()[1].replace(")", "")
+            elif line.startswith("(ref"):
+                tokens = line.split()
+                if len(tokens) >= 2:
+                    comp["Component"] = tokens[1].replace(")", "")
+            elif line.startswith("(value"):
+                tokens = line.split()
+                if len(tokens) >= 2:
+                    comp["Value"] = tokens[1].replace(")", "")
+            elif line.startswith("(footprint"):
+                tokens = line.split()
+                if len(tokens) >= 2:
+                    comp["Footprint"] = tokens[1].replace(")", "")
+                else:
+                    comp["Footprint"] = "UNKNOWN"
                 components.append(comp)
     return pd.DataFrame(components)
 
@@ -80,3 +90,4 @@ if submit and rag1_file and netlist_file and safety_goal:
         st.dataframe(result_df, use_container_width=True)
 else:
     st.info("Please upload required files and enter safety goal to begin.")
+

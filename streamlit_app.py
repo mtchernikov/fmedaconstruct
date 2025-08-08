@@ -61,26 +61,42 @@ if submit and rag1_file and netlist_file and safety_goal:
         # Load RAG1
         rag1_df = pd.read_csv(rag1_file)
 
-        # Load RAG2 if provided (not used directly here, but could be used in fine-tuned models)
+        # Load RAG2 if provided (not used directly here)
         if rag2_file:
             rag2_df = pd.read_csv(rag2_file)
 
         # Parse netlist
         netlist_df = parse_netlist(netlist_file)
 
-        # Merge and simulate FMEDA (placeholder logic — replace with actual LLM call)
-        merged = netlist_df.merge(rag1_df, how="left", left_on="Value", right_on="Normalized_Component")
+        if netlist_df.empty:
+            st.error("❌ No components found in netlist. Please check the file format.")
+            st.stop()
+
+        # Try to find usable column to merge
+        merge_key = None
+        for candidate in ["Normalized_Component", "Component", "Value", "PartNumber"]:
+            if candidate in rag1_df.columns:
+                merge_key = candidate
+                break
+
+        if not merge_key:
+            st.error("❌ Could not find a valid column in RAG1 to merge with netlist 'Value'")
+            st.stop()
+
+        # Merge
+        merged = netlist_df.merge(rag1_df, how="left", left_on="Value", right_on=merge_key)
 
         # Add failure impact analysis placeholder
         merged["Violates Safety Goal"] = merged.apply(
-            lambda row: "Yes" if pd.notna(row["Failure Mode"]) and "input" in safety_goal.lower() and "op" in str(row["Component"]).lower() else "No",
+            lambda row: "Yes" if pd.notna(row.get("Failure Mode")) and "input" in safety_goal.lower() and "op" in str(row.get("Component", "")).lower() else "No",
             axis=1
         )
 
         # Rename for clarity
         result_df = merged[[
-            "Component", "Value", "Category", "Subcategory",
-            "Base FIT", "Failure Mode", "Probability (%)", "Violates Safety Goal"
+            "Component", "Value",
+            *(col for col in ["Category", "Subcategory", "Base FIT", "Failure Mode", "Probability (%)"] if col in merged.columns),
+            "Violates Safety Goal"
         ]].rename(columns={
             "Base FIT": "Base Failure Rate (FIT)",
             "Probability (%)": "Failure Mode Distribution (%)"
@@ -90,4 +106,3 @@ if submit and rag1_file and netlist_file and safety_goal:
         st.dataframe(result_df, use_container_width=True)
 else:
     st.info("Please upload required files and enter safety goal to begin.")
-

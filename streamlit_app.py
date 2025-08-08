@@ -55,6 +55,28 @@ def parse_netlist(file):
                 components.append(comp)
     return pd.DataFrame(components)
 
+# --- Helper Function: LLM call ---
+def ask_llm_about_fault(component_name, failure_mode, safety_goal):
+    prompt = f"""
+You are a functional safety expert. A fault has occurred in component '{component_name}' with failure mode: '{failure_mode}'.
+Safety goal: "{safety_goal}".
+
+Would this fault violate the safety goal? Answer 'Yes' or 'No' and briefly explain.
+"""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            api_key=st.secrets["OPENAI_API_KEY"],
+            messages=[
+                {"role": "system", "content": "You are an expert in FMEDA and ISO 26262 safety analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+        )
+        return response.choices[0].message["content"].strip()
+    except Exception as e:
+        return f"LLM error: {e}"
+
 # --- Process ---
 if submit and rag1_file and netlist_file and safety_goal:
     with st.spinner("Processing files and generating FMEDA table..."):
@@ -86,9 +108,10 @@ if submit and rag1_file and netlist_file and safety_goal:
         # Merge
         merged = netlist_df.merge(rag1_df, how="left", left_on="Value", right_on=merge_key)
 
-        # Add failure impact analysis placeholder
+        # Call LLM for each component
         merged["Violates Safety Goal"] = merged.apply(
-            lambda row: "Yes" if pd.notna(row.get("Failure Mode")) and "input" in safety_goal.lower() and "op" in str(row.get("Component", "")).lower() else "No",
+            lambda row: ask_llm_about_fault(row["Component"], row.get("Failure Mode", "unknown"), safety_goal)
+            if pd.notna(row.get("Failure Mode")) else "N/A",
             axis=1
         )
 

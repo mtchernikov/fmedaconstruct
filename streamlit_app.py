@@ -92,102 +92,114 @@ def parse_kicad_sch_components(sch_text:str)->pd.DataFrame:
     return df[["RefDes","ComponentType","ct_norm"]]
 
 # --------- Failure DB parser (delimiter auto-detect + header mapping + numeric) ----------
-def parse_failure_csv_with_mapping(upload)->pd.DataFrame:
-    raw_bytes=upload.read(); upload.seek(0)
-    sample=raw_bytes[:4096].decode("utf-8",errors="ignore")
+def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
+    import csv, io, re
+    import pandas as pd
+
+    raw_bytes = upload.read()
+    upload.seek(0)
+
+    # --- delimiter sniffing ---
+    sample = raw_bytes[:4096].decode("utf-8", errors="ignore")
     try:
-        dialect=csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
-        sep_guess=dialect.delimiter
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
+        sep_guess = dialect.delimiter
     except Exception:
-        sep_guess=None
+        sep_guess = None
 
     def _read(sep):
         return pd.read_csv(io.BytesIO(raw_bytes), sep=sep, engine="python", dtype=str)
 
     if sep_guess:
-        raw=_read(sep_guess)
+        raw = _read(sep_guess)
     else:
         try:
-            raw=pd.read_csv(io.BytesIO(raw_bytes), sep=None, engine="python", dtype=str)
+            raw = pd.read_csv(io.BytesIO(raw_bytes), sep=None, engine="python", dtype=str)
         except Exception:
-            raw=_read(",")
+            raw = _read(",")
 
-    if raw.shape[1]==1 and ";" in raw.columns[0]:
-        cols=[c.strip() for c in raw.columns[0].split(";")]
-        tmp=raw.iloc[:,0].str.split(";",expand=True)
-        if tmp.shape[1]==len(cols):
-            tmp.columns=cols; raw=tmp
+    # header packed with ';' ?
+    if raw.shape[1] == 1 and ";" in raw.columns[0]:
+        cols = [c.strip() for c in raw.columns[0].split(";")]
+        tmp = raw.iloc[:,0].str.split(";", expand=True)
+        if tmp.shape[1] == len(cols):
+            tmp.columns = cols
+            raw = tmp
 
     st.write("CSV columns:", list(raw.columns))
 
-    norm={c:_norm(c) for c in raw.columns}
+    norm = {c: re.sub(r'[^a-z0-9]', '', c.strip().lower()) for c in raw.columns}
     def find_col(cands):
-        for orig,n in norm.items():
-            if n in cands: return orig
+        for orig, n in norm.items():
+            if n in cands:
+                return orig
         return None
 
-    c_type=find_col({"componenttype","type","class","category","parttype","compclass"})
-    c_mode=find_col({"failuremode","mode","fm"})
-    c_share=find_col({"share","modeshare","distribution","percent","modesharepercent","modesharepct"})
-    c_fit  =find_col({"fit","lambda","rate","fitrate","lambdafit","lambdafitper1e9h"})
-    c_dc   =find_col({"dc","diagnosticcoverage","coverage","diagcoverage"})
-    c_det  =find_col({"detectable","detected","isdetected"})
-    c_dnm  =find_col({"diagnosticname","diag","diagnostic"})
+    c_type = find_col({"componenttype","type","class","category","parttype","compclass"})
+    c_mode = find_col({"failuremode","mode","fm"})
+    c_share= find_col({"share","modeshare","distribution","percent","modesharepercent","modesharepct"})
+    c_fit  = find_col({"fit","lambda","rate","fitrate","lambdafit","lambdafitper1e9h"})
+    c_dc   = find_col({"dc","diagnosticcoverage","coverage","diagcoverage"})
+    c_det  = find_col({"detectable","detected","isdetected"})
+    c_dnm  = find_col({"diagnosticname","diag","diagnostic"})
 
-    missing=[name for name,col in {"Component Type":c_type,"Failure Mode":c_mode,"Mode Share":c_share,"FIT":c_fit}.items() if col is None]
+    missing = [name for name,col in {
+        "Component Type": c_type, "Failure Mode": c_mode, "Mode Share": c_share, "FIT": c_fit
+    }.items() if col is None]
     if missing:
-        st.warning("Map missing CSV columns:")
-        cols=list(raw.columns)
-        c_type=st.selectbox("Component Type column", cols, index=0 if c_type is None else cols.index(c_type))
-        c_mode=st.selectbox("Failure Mode column", cols, index=0 if c_mode is None else cols.index(c_mode))
-        c_share=st.selectbox("Mode Share column", cols, index=0 if c_share is None else cols.index(c_share))
-        c_fit  =st.selectbox("FIT column", cols, index=0 if c_fit is None else cols.index(c_fit))
-        c_dc   =st.selectbox("Diagnostic Coverage column (optional)", ["<none>"]+cols, index=0)
-        c_det  =st.selectbox("Detectable column (optional)", ["<none>"]+cols, index=0)
-        c_dnm  =st.text_input("Diagnostic Name column (optional)", value=c_dnm or "")
-        c_dc=None if c_dc=="<none>" else c_dc
-        c_det=None if c_det=="<none>" else c_det
-        c_dnm=None if not c_dnm else c_dnm
+        st.warning(f"Please map missing columns: {', '.join(missing)}")
+        cols = list(raw.columns)
+        c_type = st.selectbox("Component Type column", cols, index=0 if c_type is None else cols.index(c_type))
+        c_mode = st.selectbox("Failure Mode column",  cols, index=0 if c_mode is None else cols.index(c_mode))
+        c_share= st.selectbox("Mode Share column",    cols, index=0 if c_share is None else cols.index(c_share))
+        c_fit  = st.selectbox("FIT column",           cols, index=0 if c_fit is None else cols.index(c_fit))
+        c_dc   = st.selectbox("Diagnostic Coverage (optional)", ["<none>"]+cols, index=0)
+        c_det  = st.selectbox("Detectable (optional)",          ["<none>"]+cols, index=0)
+        c_dnm  = st.text_input("Diagnostic Name (optional)", value=c_dnm or "")
+        c_dc = None if c_dc == "<none>" else c_dc
+        c_det= None if c_det == "<none>" else c_det
+        c_dnm= None if not c_dnm else c_dnm
 
-    out=pd.DataFrame()
-    # Canonicalize ComponentType value if hierarchical like 'Resistor;Passive;Fixed'
-    def canon_type_cell(s:str)->str:
-        parts=[p.strip() for p in str(s).split(";") if p.strip()]
+    # -------- Series-safe numeric parser --------
+    def to_num_series(series: pd.Series) -> pd.Series:
+        return pd.to_numeric(series.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+    # Component type canonicalization (handles hierarchical strings with ';')
+    def canonicalize_type_cell(s: str) -> str:
+        parts = [p.strip() for p in str(s).split(";") if p.strip()]
         if not parts: return ""
-        base={"resistor","capacitor","capacitor_polarized","inductor","diode","zener",
-              "bjt","mosfet","opamp","comparator","relay","fuse","connector"}
+        base = {"resistor","capacitor","capacitor_polarized","inductor","diode","zener",
+                "bjt","mosfet","opamp","comparator","relay","fuse","connector"}
         for p in parts:
-            p0=_norm(p)
-            if p0 in base: return p.capitalize()
+            if re.sub(r'[^a-z0-9]', '', p.lower()) in base:
+                return p.capitalize()
         return parts[0]
 
-    out["ComponentType"]=raw[c_type].astype(str).fillna("").map(canon_type_cell)
-    out["FailureMode"]=raw[c_mode].astype(str).fillna("").str.strip()
+    out = pd.DataFrame()
+    out["ComponentType"] = raw[c_type].astype(str).fillna("").map(canonicalize_type_cell)
+    out["FailureMode"]   = raw[c_mode].astype(str).fillna("").str.strip()
 
-    # Numbers: accept comma decimal & percent
-    def to_num(s):
-        s=str(s)
-        s=s.replace(",", ".")
-        return pd.to_numeric(s, errors="coerce")
-    share=to_num(raw[c_share]).fillna(0.0)
-    if share.max()>1.5: share=share/100.0
-    out["Share"]=share.clip(lower=0)
+    share = to_num_series(raw[c_share]).fillna(0.0)
+    if share.max() > 1.5:  # treat as percent if >150%
+        share = share / 100.0
+    out["Share"] = share.clip(lower=0)
 
-    out["FIT"]=to_num(raw[c_fit])
+    out["FIT"] = to_num_series(raw[c_fit])
 
-    out["DC"]=to_num(raw[c_dc]).fillna(0.0).clip(0,1) if c_dc else 0.0
+    out["DC"]  = to_num_series(raw[c_dc]).fillna(0.0).clip(0,1) if c_dc else 0.0
     if c_det:
-        v=raw[c_det].astype(str).str.strip().str.lower()
-        out["Detectable"]=v.isin(["1","true","yes","y","t"])
+        v = raw[c_det].astype(str).str.strip().str.lower()
+        out["Detectable"] = v.isin(["1","true","yes","y","t"])
     else:
-        out["Detectable"]=False
-    out["DiagnosticName"]=raw[c_dnm].astype(str) if (c_dnm and c_dnm in raw.columns) else ""
+        out["Detectable"] = False
+    out["DiagnosticName"] = raw[c_dnm].astype(str) if (c_dnm and c_dnm in raw.columns) else ""
 
-    out["ct_norm"]=out["ComponentType"].map(_norm)
-
+    # normalized join key
+    out["ct_norm"] = out["ComponentType"].apply(lambda s: re.sub(r'[^a-z0-9]', '', s.strip().lower()))
     st.success("Failure DB parsed.")
     st.dataframe(out.head(20), height=240)
     return out
+
 
 # --------- Expand components × failure modes (cross-merge by type) ----------
 def expand_fmeda(components_df:pd.DataFrame, failure_df:pd.DataFrame)->pd.DataFrame:
@@ -299,3 +311,4 @@ if sch_file:
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Upload a KiCad 9 schematic to start.")
+

@@ -110,13 +110,56 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
 
 # ---------- FAILURE CSV (robust detection + optional UI mapping) ----------
 def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
-    raw = pd.read_csv(upload)
-    st.write("CSV columns:", list(raw.columns))
+    import csv
+    import io
+    import pandas as pd
+    import re
 
-    norm = {c: re.sub(r'[^a-z0-9]', '', c.strip().lower()) for c in raw.columns}
-    def find_col(cands): 
+    raw_bytes = upload.read()
+    upload.seek(0)
+
+    # 1) Try automatic delimiter detection
+    sample = raw_bytes[:4096].decode("utf-8", errors="ignore")
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
+        sep_guess = dialect.delimiter
+    except Exception:
+        sep_guess = None
+
+    # 2) Read with best guess; fallbacks if we still get 1 column
+    def _read_with(sep):
+        return pd.read_csv(io.BytesIO(raw_bytes), sep=sep, engine="python", decimal=",", dtype=str)
+
+    if sep_guess:
+        raw = _read_with(sep_guess)
+    else:
+        # pandas autodetect
+        try:
+            raw = pd.read_csv(io.BytesIO(raw_bytes), sep=None, engine="python", decimal=",", dtype=str)
+        except Exception:
+            raw = _read_with(",")
+
+    if raw.shape[1] == 1:
+        # brute-force fallbacks
+        for s in [";", "\t", "|", ","]:
+            raw = _read_with(s)
+            if raw.shape[1] > 1:
+                break
+
+    # 3) If header line itself is packed (e.g., 'ComponentType;FailureMode;Share;FIT')
+    if raw.shape[1] == 1 and ";" in raw.columns[0]:
+        cols = [c.strip() for c in raw.columns[0].split(";")]
+        tmp = raw.iloc[:,0].str.split(";", expand=True)
+        if tmp.shape[1] == len(cols):
+            tmp.columns = cols
+            raw = tmp
+
+    # Normalize header names for matching
+    norm = {c: re.sub(r"[^a-z0-9]", "", c.strip().lower()) for c in raw.columns}
+    def find_col(cands):
         for orig, n in norm.items():
-            if n in cands: return orig
+            if n in cands:
+                return orig
         return None
 
     c_type = find_col({"componenttype","type","class","category","parttype","compclass"})
@@ -127,33 +170,52 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
     c_det  = find_col({"detectable","detected","isdetected"})
     c_dnm  = find_col({"diagnosticname","diag","diagnostic"})
 
+    # 4) If still missing, ask user to map once
     missing = [name for name,col in {
         "Component Type": c_type, "Failure Mode": c_mode, "Mode Share": c_share, "FIT": c_fit
     }.items() if col is None]
-
     if missing:
         st.warning(f"Please map missing columns: {', '.join(missing)}")
         cols = list(raw.columns)
-        c_type = st.selectbox("Column for Component Type", cols, index=0)
-        c_mode = st.selectbox("Column for Failure Mode", cols, index=0)
-        c_share= st.selectbox("Column for Mode Share", cols, index=0)
-        c_fit  = st.selectbox("Column for FIT", cols, index=0)
+        c_type = st.selectbox("Column for Component Type", cols, index=0 if c_type is None else cols.index(c_type))
+        c_mode = st.selectbox("Column for Failure Mode", cols, index=0 if c_mode is None else cols.index(c_mode))
+        c_share= st.selectbox("Column for Mode Share", cols, index=0 if c_share is None else cols.index(c_share))
+        c_fit  = st.selectbox("Column for FIT", cols, index=0 if c_fit is None else cols.index(c_fit))
         c_dc   = st.selectbox("Column for Diagnostic Coverage (optional)", ["<none>"]+cols, index=0)
         c_det  = st.selectbox("Column for Detectable (optional)", ["<none>"]+cols, index=0)
-        c_dnm  = st.text_input("Column for Diagnostic Name (optional)", value="")
+        c_dnm  = st.text_input("Column for Diagnostic Name (optional)", value=c_dnm or "")
         c_dc = None if c_dc == "<none>" else c_dc
         c_det= None if c_det == "<none>" else c_det
         c_dnm= None if not c_dnm else c_dnm
 
+    # 5) Build normalized table
     out = pd.DataFrame()
-    out["ComponentType"] = raw[c_type].astype(str).str.strip()
-    out["FailureMode"]   = raw[c_mode].astype(str).str.strip()
+    out["ComponentType"] = raw[c_type].astype(str).fillna("").str.strip()
+    out["FailureMode"]   = raw[c_mode].astype(str).fillna("").str.strip()
 
-    share = pd.to_numeric(raw[c_share], errors="coerce").fillna(0.0)
+    # If a cell carries a whole hierarchy: 'Resistor;Passive;Fixed Resistor'
+    def canonicalize_type_cell(s: str) -> str:
+        parts = [p.strip() for p in str(s).split(";") if p.strip()]
+        if not parts: return ""
+        # Prefer a known base class if present
+        base_set = {"resistor","capacitor","capacitor_polarized","inductor","diode","zener",
+                    "bjt","mosfet","opamp","comparator","relay","fuse","connector"}
+        for p in parts:
+            p0 = re.sub(r"[^a-z0-9]", "", p.lower())
+            if p0 in base_set:
+                return p.capitalize()
+        return parts[0]  # fallback to first token
+
+    out["ComponentType"] = out["ComponentType"].map(canonicalize_type_cell)
+
+    # Shares and FITs
+    share = pd.to_numeric(raw[c_share].astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0.0)
     if share.max() > 1.5: share = share / 100.0
     out["Share"] = share.clip(lower=0)
 
-    out["FIT"] = pd.to_numeric(raw[c_fit], errors="coerce")
+    fit = pd.to_numeric(raw[c_fit].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    out["FIT"] = fit
+
     out["DC"]  = pd.to_numeric(raw[c_dc], errors="coerce").fillna(0.0).clip(0,1) if c_dc else 0.0
     if c_det:
         v = raw[c_det].astype(str).str.strip().str.lower()
@@ -162,7 +224,11 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
         out["Detectable"] = False
     out["DiagnosticName"] = raw[c_dnm].astype(str) if (c_dnm and c_dnm in raw.columns) else ""
 
+    # Final sanity: show preview
+    st.success("Failure DB parsed.")
+    st.dataframe(out.head(20), height=240)
     return out
+
 
 # ---------- EXPAND: schematic × failure modes ----------
 def merge_with_failure_modes(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.DataFrame:
@@ -302,3 +368,4 @@ if sch_file:
             )
 else:
     st.info("Upload a KiCad 9 schematic (.kicad_sch) to begin.")
+

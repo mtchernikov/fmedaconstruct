@@ -100,35 +100,90 @@ def detect_component_type(ref,lib_id,value)->str:
     return t or "Other"
 
 # ------- Failure DB (single CSV) -------
-def parse_failure_csv(file)->pd.DataFrame:
-    df=pd.read_csv(file)
-    def pick(*names):
-        for n in names:
-            c=next((c for c in df.columns if c.strip().lower()==n),None)
-            if c: return c
+def parse_failure_csv(file) -> pd.DataFrame:
+    raw = pd.read_csv(file)
+    # Normalize header strings once
+    norm = {c: re.sub(r'[^a-z0-9]', '', c.strip().lower()) for c in raw.columns}
+
+    # Helper: find column by a set of acceptable normalized names
+    def find_col(candidates):
+        for orig, n in norm.items():
+            if n in candidates:
+                return orig
         return None
-    ctype=pick("componenttype","type","class") or "ComponentType"
-    fmode=pick("failuremode","mode") or "FailureMode"
-    share=pick("share","modeshare","distribution","percent") or "Share"
-    fit  =pick("fit","lambda","rate") or "FIT"
-    dc   =pick("dc","diagnosticcoverage","coverage"); det=pick("detectable","detected"); dname=pick("diagnosticname","diag")
-    if share not in df: df[share]=1.0
-    if fit not in df: df[fit]=0.0
-    if not dc: df["DC"]=0.0
-    else: df.rename(columns={dc:"DC"}, inplace=True)
-    if not det: df["Detectable"]=False
-    else: df.rename(columns={det:"Detectable"}, inplace=True)
-    if dname and dname!="DiagnosticName": df.rename(columns={dname:"DiagnosticName"}, inplace=True)
-    if "DiagnosticName" not in df: df["DiagnosticName"]=""
-    if df[share].max()>1.5: df[share]=df[share]/100.0
-    def canonize(s:str)->str:
-        s=(str(s).strip().lower())
-        for canon,syns in TYPE_SYNONYMS.items():
-            if s==canon.lower() or s in syns: return canon
+
+    # Try broad synonym sets
+    col_type = find_col({"componenttype","type","class","category","parttype","compclass"})
+    col_mode = find_col({"failuremode","mode","fm"})
+    col_share = find_col({"share","modeshare","distribution","percent","modesharepercent","modesharepct"})
+    col_fit   = find_col({"fit","lambda","rate","fitrate","lambdaft"})
+    col_dc    = find_col({"dc","diagnosticcoverage","coverage","diagcoverage"})
+    col_det   = find_col({"detectable","detected","isdetected"})
+    col_dname = find_col({"diagnosticname","diag","diagnostic"})
+
+    # If any critical column missing, ask user to map interactively
+    missing = []
+    if col_type is None: missing.append("Component Type")
+    if col_mode is None: missing.append("Failure Mode")
+    if col_share is None: missing.append("Mode Share")
+    if col_fit is None: missing.append("FIT")
+
+    if missing:
+        st.warning(f"Please map missing columns: {', '.join(missing)}")
+        cols = list(raw.columns)
+        col_type = st.selectbox("Column for Component Type", cols, index=0 if col_type is None else cols.index(col_type))
+        col_mode = st.selectbox("Column for Failure Mode", cols, index=0 if col_mode is None else cols.index(col_mode))
+        col_share = st.selectbox("Column for Mode Share", cols, index=0 if col_share is None else cols.index(col_share))
+        col_fit   = st.selectbox("Column for FIT", cols, index=0 if col_fit is None else cols.index(col_fit))
+        col_dc    = st.selectbox("Column for Diagnostic Coverage (optional)", ["<none>"]+cols, index=0)
+        col_det   = st.selectbox("Column for Detectable (optional)", ["<none>"]+cols, index=0)
+        col_dname = st.text_input("Column for Diagnostic Name (optional)", value=col_dname or "")
+
+        col_dc = None if col_dc == "<none>" else col_dc
+        col_det = None if col_det == "<none>" else col_det
+        col_dname = None if not col_dname else col_dname
+
+    # Build output with defaults
+    out = pd.DataFrame()
+    out["ComponentType"] = raw[col_type].astype(str).str.strip()
+    out["FailureMode"] = raw[col_mode].astype(str).str.strip()
+    # Share: accept % or fraction
+    share_series = pd.to_numeric(raw[col_share], errors="coerce").fillna(0.0)
+    if share_series.max() > 1.5:  # looks like percent
+        share_series = share_series / 100.0
+    out["Share"] = share_series.clip(lower=0.0)
+    # FIT
+    out["FIT"] = pd.to_numeric(raw[col_fit], errors="coerce").fillna(0.0)
+
+    # Optionals
+    if col_dc is not None:
+        out["DC"] = pd.to_numeric(raw[col_dc], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    else:
+        out["DC"] = 0.0
+    if col_det is not None:
+        # Treat non-empty/nonzero as True
+        v = raw[col_det]
+        out["Detectable"] = v.astype(str).str.strip().str.lower().isin(["1","true","yes","y","t"])
+    else:
+        out["Detectable"] = False
+    if col_dname is not None and col_dname in raw.columns:
+        out["DiagnosticName"] = raw[col_dname].astype(str).fillna("")
+    else:
+        out["DiagnosticName"] = ""
+
+    # Canonicalize ComponentType to match our internal types
+    def canonize(s: str) -> str:
+        s = (s or "").strip().lower()
+        for canon, syns in TYPE_SYNONYMS.items():
+            if s == canon.lower() or s in syns:
+                return canon
         return "Other"
-    out=df.rename(columns={ctype:"ComponentType",fmode:"FailureMode",share:"Share",fit:"FIT"})
-    out["ComponentTypeNorm"]=out["ComponentType"].apply(canonize)
+
+    out["ComponentTypeNorm"] = out["ComponentType"].apply(canonize)
+
+    # Final column order
     return out[["ComponentType","ComponentTypeNorm","FailureMode","Share","FIT","Detectable","DC","DiagnosticName"]]
+
 
 # ------- Safety goal -------
 def parse_safety_goal(text:str)->Dict[str,Any]:
@@ -332,3 +387,4 @@ if "_results" in st.session_state:
     st.download_button("Download FMEDA (XLSX)", xbuf.getvalue(), "fmeda_results.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.download_button("Download FMEDA (JSON)", df.to_json(orient="records", indent=2).encode("utf-8"), "fmeda_results.json","application/json")
+

@@ -91,19 +91,27 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
     return df[["RefDes","ComponentType","ct_norm"]]
 
 # ================= Failure DB parsing =================
-_num_pat = re.compile(r'[-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?')
+# put this near the top with the other helpers
+_num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')  # <-- wrapped in (...) to create one capture group
+
 def parse_number_series(s: pd.Series) -> pd.Series:
-    v = s.astype(str).str.extract(_num_pat, expand=False)
+    # extract first numeric token, normalize decimal comma, convert to float
+    v = s.astype(str).str.extract(_num_pat, expand=True)[0]     # <-- select the captured group
     v = v.str.replace(",", ".", regex=False)
     return pd.to_numeric(v, errors="coerce")
+
 def parse_share_series(s: pd.Series) -> pd.Series:
     raw = s.astype(str)
     nums = parse_number_series(raw)
+    # percent handling
     is_pct = raw.str.contains("%")
     nums = nums.where(~is_pct, nums / 100.0)
-    if nums.max(skipna=True) and nums.max(skipna=True) > 1.5:
+    # if values look like 45 not 0.45, scale to fraction
+    maxv = pd.to_numeric(nums, errors="coerce").max(skipna=True)
+    if pd.notna(maxv) and maxv > 1.5:
         nums = nums / 100.0
     return nums
+
 
 def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
     raw_bytes = upload.read(); upload.seek(0)
@@ -297,3 +305,4 @@ if sch_file:
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Upload a KiCad 9 schematic to start.")
+

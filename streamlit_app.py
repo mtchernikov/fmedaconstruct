@@ -55,10 +55,18 @@ def merge_with_failure_modes(components_df, failure_rates_df):
     """Merge extracted components with Failure Rates/Modes table."""
     merged_rows = []
 
+    # Detect actual ComponentType column name in CSV
+    possible_cols = [c for c in failure_rates_df.columns if c.strip().lower() == "componenttype"]
+    if possible_cols:
+        comp_col = possible_cols[0]
+    else:
+        st.error("Failure Rates CSV must contain a 'ComponentType' column.")
+        st.stop()
+
     for _, comp in components_df.iterrows():
         comp_type = comp["ComponentType"]
         match_df = failure_rates_df[
-            failure_rates_df["ComponentType"].str.strip().str.lower() == comp_type.lower()
+            failure_rates_df[comp_col].astype(str).str.strip().str.lower() == comp_type.lower()
         ]
 
         if match_df.empty:
@@ -126,26 +134,42 @@ safety_goal = st.text_input("Enter Safety Goal", "Prevent unintended output > 5V
 sch_file = st.file_uploader("Upload KiCad .kicad_sch", type=["kicad_sch"])
 failure_csv = st.file_uploader("Upload Failure Rates & Modes CSV", type=["csv"])
 
-if sch_file and failure_csv:
+if sch_file:
+    # Step 1: Extract components from schematic
     sch_text = sch_file.read().decode("utf-8")
     components_df = parse_kicad_sch_components(sch_text)
-    failure_rates_df = pd.read_csv(failure_csv)
 
-    merged_fmeda_df = merge_with_failure_modes(components_df, failure_rates_df)
+    # Step 2: Let user verify/edit ComponentType
+    st.subheader("Detected Components (Edit if necessary)")
+    components_df = st.data_editor(
+        components_df,
+        num_rows="dynamic",
+        height=400
+    )
 
-    # Classification step
-    labels, reasons = [], []
-    for _, row in merged_fmeda_df.iterrows():
-        label, reason = llm_classify_row(row, safety_goal)
-        labels.append(label)
-        reasons.append(reason)
+    if failure_csv and st.button("Run FMEDA Classification"):
+        failure_rates_df = pd.read_csv(failure_csv)
 
-    merged_fmeda_df["Label"] = labels
-    merged_fmeda_df["Reason"] = reasons
+        merged_fmeda_df = merge_with_failure_modes(components_df, failure_rates_df)
 
-    st.subheader("FMEDA with Classification")
-    st.dataframe(merged_fmeda_df)
+        # Step 3: LLM classification
+        labels, reasons = [], []
+        for _, row in merged_fmeda_df.iterrows():
+            label, reason = llm_classify_row(row, safety_goal)
+            labels.append(label)
+            reasons.append(reason)
 
-    # Export
-    csv_bytes = merged_fmeda_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download FMEDA CSV", csv_bytes, "fmeda_with_classification.csv", "text/csv")
+        merged_fmeda_df["Label"] = labels
+        merged_fmeda_df["Reason"] = reasons
+
+        st.subheader("FMEDA with Classification")
+        st.dataframe(merged_fmeda_df)
+
+        # Export
+        csv_bytes = merged_fmeda_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download FMEDA CSV",
+            csv_bytes,
+            "fmeda_with_classification.csv",
+            "text/csv"
+        )

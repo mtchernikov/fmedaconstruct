@@ -1,175 +1,108 @@
-import streamlit as st
-import pandas as pd
 import re
-import json
-from openai import OpenAI
+import pandas as pd
 
-# Mapping from KiCad prefix to failure DB component types
-COMPONENT_TYPE_MAP = {
-    "R": "Resistor",
-    "RES": "Resistor",
-    "C": "Capacitor",
-    "CAP": "Capacitor",
-    "U": "OpAmp",
-    "Q": "MOSFET",
-    "M": "MOSFET",
-    "D": "Diode",
-    "L": "Inductor",
+# ---- helpers for type detection (reuse your existing ones if you have them) ----
+REF_PREFIX = {
+    "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
+    "Q":"MOSFET","T":"BJT","U":"IC_Analog","A":"OpAmp","K":"Relay","F":"Fuse",
+    "J":"Connector","X":"Connector"
 }
+def detect_type_from_ref(ref: str):
+    if not ref: return None
+    m = re.match(r"^([A-Za-z]+)", ref)
+    if not m: return None
+    pref = m.group(1).upper()
+    for p in sorted(REF_PREFIX, key=lambda x: -len(x)):
+        if pref.startswith(p):
+            return REF_PREFIX[p]
+    return None
 
-# Initialize OpenAI
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+def detect_type_from_lib(lib_id: str):
+    s = (lib_id or "").lower()
+    if "opamp" in s or "amplifier_operational" in s: return "OpAmp"
+    if ":cp" in s or "electroly" in s: return "Capacitor_Polarized"
+    if ":c" in s or "capacitor" in s: return "Capacitor"
+    if ":r" in s or "resistor" in s: return "Resistor"
+    if "lm393" in s or "comparator" in s: return "Comparator"
+    if "mos" in s or "nmos" in s or "pmos" in s or "irf" in s: return "MOSFET"
+    if "diode" in s: return "Diode"
+    if "connector" in s or "audiojack" in s: return "Connector"
+    if "relay" in s: return "Relay"
+    if "fuse" in s: return "Fuse"
+    return None
 
-def parse_kicad_sch_components(sch_text):
-    """Extract components from KiCad 9 schematic text."""
-    components = []
-    matches = re.findall(r'\(symbol\s+("[^"]+")\s+(.*?)\)\s*\)', sch_text, re.DOTALL)
+def detect_type_from_value(val: str):
+    t = (val or "").lower()
+    if re.search(r'(^|\s)\d+(\.\d+)?(r|k|m)?(\s*ohm|$)', t): return "Resistor"
+    if re.search(r'(^|\s)\d+(\.\d+)?(n|u|µ|p|f)(\s*|$)', t): return "Capacitor"
+    if "ne5532" in t or "lm358" in t: return "OpAmp"
+    if "irf" in t or "irfp" in t: return "MOSFET"
+    return None
 
-    for m in matches:
-        body = m[1]
-        ref_match = re.search(r'\(property\s+"Reference"\s+"([^"]+)"', body)
-        ref = ref_match.group(1) if ref_match else "?"
+# ---- NEW robust S-expression parser for symbols ----
+def _iter_sexpr_blocks(text: str, tag: str):
+    """Yield full balanced blocks starting with '(tag' (e.g. 'symbol')."""
+    needle = f"({tag}"
+    n = len(text)
+    start = text.find(needle)
+    while start != -1:
+        i = start
+        depth = 0
+        started = False
+        while i < n:
+            ch = text[i]
+            if ch == "(":
+                depth += 1
+                started = True
+            elif ch == ")":
+                depth -= 1
+                if started and depth == 0:
+                    yield text[start:i+1]
+                    break
+            i += 1
+        # continue search after this block
+        start = text.find(needle, i)
 
-        val_match = re.search(r'\(property\s+"Value"\s+"([^"]+)"', body)
-        value = val_match.group(1) if val_match else ""
-
-        prefix = re.match(r"[A-Za-z]+", ref)
-        if prefix:
-            prefix = prefix.group(0).upper()
-        comp_type = COMPONENT_TYPE_MAP.get(prefix, None)
-
-        if comp_type is None:
-            val_up = value.upper()
-            if "RES" in val_up or re.match(r"\d+[kKmM]?", val_up):
-                comp_type = "Resistor"
-            elif "CAP" in val_up or re.match(r"\d+uF|\d+nF|\d+pF", val_up, re.IGNORECASE):
-                comp_type = "Capacitor"
-            else:
-                comp_type = "unknown component"
-
-        components.append({"RefDes": ref, "ComponentType": comp_type})
-
-    return pd.DataFrame(components)
-
-def merge_with_failure_modes(components_df, failure_rates_df):
-    """Merge extracted components with Failure Rates/Modes table."""
-    merged_rows = []
-
-    # Detect actual ComponentType column name in CSV
-    possible_cols = [c for c in failure_rates_df.columns if c.strip().lower() == "componenttype"]
-    if possible_cols:
-        comp_col = possible_cols[0]
-    else:
-        st.error("Failure Rates CSV must contain a 'ComponentType' column.")
-        st.stop()
-
-    for _, comp in components_df.iterrows():
-        comp_type = comp["ComponentType"]
-        match_df = failure_rates_df[
-            failure_rates_df[comp_col].astype(str).str.strip().str.lower() == comp_type.lower()
-        ]
-
-        if match_df.empty:
-            merged_rows.append({
-                "RefDes": comp["RefDes"],
-                "ComponentType": comp_type,
-                "FailureMode": "unknown",
-                "Share": None,
-                "FIT": None,
-                "DC": None,
-                "Detectable": None,
-                "DiagnosticName": None
-            })
-        else:
-            for _, fm in match_df.iterrows():
-                merged_rows.append({
-                    "RefDes": comp["RefDes"],
-                    "ComponentType": comp_type,
-                    "FailureMode": fm.get("FailureMode"),
-                    "Share": fm.get("Share"),
-                    "FIT": fm.get("FIT"),
-                    "DC": fm.get("DC"),
-                    "Detectable": fm.get("Detectable"),
-                    "DiagnosticName": fm.get("DiagnosticName")
-                })
-
-    return pd.DataFrame(merged_rows)
-
-def llm_classify_row(row, safety_goal):
-    """Classify Safe/Unsafe using LLM."""
-    prompt = f"""
-    You are an expert in FMEDA for electronics safety.
-    Safety Goal: {safety_goal}
-
-    Component:
-      RefDes: {row['RefDes']}
-      Type: {row['ComponentType']}
-      Failure Mode: {row['FailureMode']}
-      FIT: {row['FIT']}
-      Diagnostic Coverage: {row['DC']}
-
-    Decide if this failure mode is SAFE or UNSAFE with respect to the Safety Goal.
-    Only respond with JSON:
-    {{
-        "label": "SAFE" | "UNSAFE" | "NEEDS_REVIEW",
-        "reason": "short explanation"
-    }}
+def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
     """
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        data = json.loads(resp.choices[0].message.content)
-        return data.get("label", "NEEDS_REVIEW"), data.get("reason", "")
-    except Exception as e:
-        return "NEEDS_REVIEW", f"LLM error: {e}"
+    Robustly extract components from KiCad 9 .kicad_sch by scanning balanced
+    '(symbol ...)' blocks and reading properties inside.
+    Returns DataFrame with columns: RefDes, ComponentType, ComponentTypeNorm (optional later).
+    """
+    rows = []
+    for block in _iter_sexpr_blocks(sch_text, "symbol"):
+        # lib_id
+        m_lib = re.search(r'\(lib_id\s+"([^"]+)"\)', block)
+        lib_id = m_lib.group(1) if m_lib else ""
 
-# Streamlit UI
-st.title("FMEDA Generator with LLM Safety Classification")
+        # properties: Reference / Value
+        # allow extra attributes inside (property "Reference" "R1" (at ...) (effects ...))
+        m_ref = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', block)
+        m_val = re.search(r'\(property\s+"Value"\s+"([^"]*)"', block)
+        ref = (m_ref.group(1) if m_ref else "").strip()
+        val = (m_val.group(1) if m_val else "").strip()
 
-safety_goal = st.text_input("Enter Safety Goal", "Prevent unintended output > 5V")
+        # determine type: ref prefix first, then lib_id, then value
+        t = detect_type_from_ref(ref)
+        t2 = detect_type_from_lib(lib_id) or detect_type_from_value(val)
+        if t == "IC_Analog" and t2:
+            t = t2
+        elif t2 and t != t2:
+            if t in ("IC_Analog", "Other") or (t == "Capacitor" and t2 == "Capacitor_Polarized"):
+                t = t2
+        ctype = t or "Other"
 
-sch_file = st.file_uploader("Upload KiCad .kicad_sch", type=["kicad_sch"])
-failure_csv = st.file_uploader("Upload Failure Rates & Modes CSV", type=["csv"])
+        # handle missing refs (shouldn’t happen normally, but be safe)
+        ref = ref if ref else "?"
 
-if sch_file:
-    # Step 1: Extract components from schematic
-    sch_text = sch_file.read().decode("utf-8")
-    components_df = parse_kicad_sch_components(sch_text)
+        rows.append({"RefDes": ref, "ComponentType": ctype, "Value": val, "LibId": lib_id})
 
-    # Step 2: Let user verify/edit ComponentType
-    st.subheader("Detected Components (Edit if necessary)")
-    components_df = st.data_editor(
-        components_df,
-        num_rows="dynamic",
-        height=400
-    )
+    if not rows:
+        # Empty schematic or pattern didn’t match
+        return pd.DataFrame(columns=["RefDes", "ComponentType"])
 
-    if failure_csv and st.button("Run FMEDA Classification"):
-        failure_rates_df = pd.read_csv(failure_csv)
-
-        merged_fmeda_df = merge_with_failure_modes(components_df, failure_rates_df)
-
-        # Step 3: LLM classification
-        labels, reasons = [], []
-        for _, row in merged_fmeda_df.iterrows():
-            label, reason = llm_classify_row(row, safety_goal)
-            labels.append(label)
-            reasons.append(reason)
-
-        merged_fmeda_df["Label"] = labels
-        merged_fmeda_df["Reason"] = reasons
-
-        st.subheader("FMEDA with Classification")
-        st.dataframe(merged_fmeda_df)
-
-        # Export
-        csv_bytes = merged_fmeda_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download FMEDA CSV",
-            csv_bytes,
-            "fmeda_with_classification.csv",
-            "text/csv"
-        )
+    df = pd.DataFrame(rows)[["RefDes", "ComponentType"]]
+    # map unknowns explicitly as you requested
+    df.loc[df["RefDes"] == "?", "ComponentType"] = "unknown component"
+    df.loc[df["ComponentType"].isna(), "ComponentType"] = "unknown component"
+    return df

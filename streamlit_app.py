@@ -1,27 +1,31 @@
 import streamlit as st
 import pandas as pd
-import re, io, csv, json, uuid
+import re, io, csv, json
 
+# ---------------------------- App config ----------------------------
 st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-
-# ---- Optional LLM (off by default) ----
 OPENAI_MODEL = "gpt-4o-mini"
+
+# Optional OpenAI client (only used if you toggle LLM)
 try:
     from openai import OpenAI
     OAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
 except Exception:
     OAI = None
 
+
+# ---------------------------- small utils ----------------------------
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
-def new_uuid(): return str(uuid.uuid4())
 
-# ================= KiCad 9 schematic parser =================
+
+# ============================ KiCad 9 parser ============================
 REF_PREFIX = {
     "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
     "Q":"MOSFET","T":"BJT","U":"IC_Analog","A":"OpAmp","K":"Relay","F":"Fuse",
     "J":"Connector","X":"Connector",
 }
+
 def detect_type_from_ref(ref: str):
     m = re.match(r'^([A-Za-z]+)', ref or "")
     if not m: return None
@@ -29,6 +33,7 @@ def detect_type_from_ref(ref: str):
     for p in sorted(REF_PREFIX, key=lambda x: -len(x)):
         if pref.startswith(p): return REF_PREFIX[p]
     return None
+
 def detect_type_from_lib(lib_id: str):
     s = (lib_id or "").lower()
     if "opamp" in s or "amplifier_operational" in s: return "OpAmp"
@@ -41,6 +46,7 @@ def detect_type_from_lib(lib_id: str):
     if "relay" in s: return "Relay"
     if "fuse" in s: return "Fuse"
     return None
+
 def detect_type_from_value(val: str):
     t = (val or "").lower()
     if re.search(r'(^|\s)\d+(\.\d+)?(r|k|m)?(\s*ohm|$)', t): return "Resistor"
@@ -80,9 +86,11 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
         if t == "IC_Analog" and t2: t = t2
         elif t2 and t != t2:
             if t in ("IC_Analog","Other") or (t == "Capacitor" and t2 == "Capacitor_Polarized"): t = t2
+
         ctype = t or "Other"
         if not ref: ref = "?"
         rows.append({"RefDes": ref, "ComponentType": ctype})
+
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["RefDes","ComponentType","ct_norm"])
@@ -90,39 +98,44 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
     df["ct_norm"] = df["ComponentType"].map(_norm)
     return df[["RefDes","ComponentType","ct_norm"]]
 
-# ================= Failure DB parsing =================
-# put this near the top with the other helpers
-_num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')  # <-- wrapped in (...) to create one capture group
+
+# ============================ Failure DB parsing ============================
+# robust number extractors (first numeric token in any text)
+_num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
 
 def parse_number_series(s: pd.Series) -> pd.Series:
-    # extract first numeric token, normalize decimal comma, convert to float
-    v = s.astype(str).str.extract(_num_pat, expand=True)[0]     # <-- select the captured group
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    v = s.astype(str).replace({"None":"", "none":"", "nan":""})
+    v = v.str.extract(_num_pat, expand=True)[0]
     v = v.str.replace(",", ".", regex=False)
     return pd.to_numeric(v, errors="coerce")
 
 def parse_share_series(s: pd.Series) -> pd.Series:
-    raw = s.astype(str)
+    raw = s.astype(str).replace({"None":"", "none":"", "nan":""})
     nums = parse_number_series(raw)
-    # percent handling
     is_pct = raw.str.contains("%")
     nums = nums.where(~is_pct, nums / 100.0)
-    # if values look like 45 not 0.45, scale to fraction
     maxv = pd.to_numeric(nums, errors="coerce").max(skipna=True)
     if pd.notna(maxv) and maxv > 1.5:
         nums = nums / 100.0
     return nums
 
-
-def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
+def parse_failure_csv_with_mapping(upload):
+    """Return: (normalized_table, raw_dataframe, share_col_name, fit_col_name)"""
     raw_bytes = upload.read(); upload.seek(0)
+
+    # delimiter sniff
     sample = raw_bytes[:4096].decode("utf-8", errors="ignore")
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
         sep_guess = dialect.delimiter
     except Exception:
         sep_guess = None
+
     def _read(sep):
         return pd.read_csv(io.BytesIO(raw_bytes), sep=sep, engine="python", dtype=str)
+
     if sep_guess:
         raw = _read(sep_guess)
     else:
@@ -131,6 +144,7 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
         except Exception:
             raw = _read(",")
 
+    # header packed by ';'?
     if raw.shape[1] == 1 and ";" in raw.columns[0]:
         cols = [c.strip() for c in raw.columns[0].split(";")]
         tmp = raw.iloc[:,0].str.split(";", expand=True)
@@ -138,6 +152,7 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
             tmp.columns = cols; raw = tmp
 
     st.write("CSV columns:", list(raw.columns))
+
     norm = {c: _norm(c) for c in raw.columns}
     def find_col(cands):
         for orig, n in norm.items():
@@ -167,8 +182,7 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
         c_det=None if c_det=="<none>" else c_det
         c_dnm=None if not c_dnm else c_dnm
 
-    out = pd.DataFrame()
-    # Canonicalize hierarchical types like 'Resistor;Passive;Fixed Resistor'
+    # canonicalize ComponentType cells like "Resistor;Passive;Fixed ..."
     def canon_type_cell(s: str) -> str:
         parts = [p.strip() for p in str(s).split(";") if p.strip()]
         if not parts: return ""
@@ -177,6 +191,8 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
         for p in parts:
             if _norm(p) in base: return p.capitalize()
         return parts[0]
+
+    out = pd.DataFrame()
     out["ComponentType"] = raw[c_type].astype(str).fillna("").map(canon_type_cell)
     out["FailureMode"]   = raw[c_mode].astype(str).fillna("").str.strip()
     out["Share"]         = parse_share_series(raw[c_share])
@@ -188,12 +204,37 @@ def parse_failure_csv_with_mapping(upload) -> pd.DataFrame:
     else:
         out["Detectable"] = False
     out["DiagnosticName"] = raw[c_dnm].astype(str) if (c_dnm and c_dnm in raw.columns) else ""
-    out["ct_norm"] = out["ComponentType"].map(_norm)
+    out["ct_norm"]        = out["ComponentType"].map(_norm)
+
     st.success("Failure DB parsed.")
     st.dataframe(out.head(20), height=240)
-    return out
 
-# ================= FMEDA expand (keeps RefDes first) =================
+    # return normalized + raw + the actual column names for debugging
+    return out, raw, c_share, c_fit
+
+
+# --------------------------- Debug helper ---------------------------
+def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n: int = 12):
+    rs = raw_df[col_share].astype(str)
+    rf = raw_df[col_fit].astype(str)
+    ps = parse_share_series(rs)
+    pf = parse_number_series(rf)
+
+    mask = rs.replace({"None":"", "nan":""}).str.strip().ne("") | \
+           rf.replace({"None":"", "nan":""}).str.strip().ne("")
+    idx = raw_df.index[mask][:n]
+
+    dbg = pd.DataFrame({
+        "Share_raw":  rs.loc[idx].values,
+        "Share_parsed": ps.loc[idx].values,
+        "FIT_raw":    rf.loc[idx].values,
+        "FIT_parsed": pf.loc[idx].values,
+    }, index=idx)
+    st.write("🔎 Parsing samples (first non-empty rows):")
+    st.dataframe(dbg, height=240)
+
+
+# ============================ FMEDA expand ============================
 def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.DataFrame:
     if "ct_norm" not in components_df.columns:
         components_df["ct_norm"] = components_df["ComponentType"].map(_norm)
@@ -213,11 +254,11 @@ def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.Da
         "Detectable":    merged["Detectable"].where(~unknown, False),
         "DiagnosticName":merged["DiagnosticName"].where(~unknown, "")
     })
-
     return out.sort_values(["RefDes","ComponentType"], kind="stable").reset_index(drop=True)
 
-# ================= Optional LLM =================
-def llm_classify_row(row, safety_goal):
+
+# ============================ Optional LLM ============================
+def llm_classify_row(row: pd.Series, safety_goal: str):
     if OAI is None:
         return "NEEDS_REVIEW", "No OpenAI key configured."
     prompt = f"""You are an FMEDA safety expert.
@@ -246,8 +287,10 @@ def compute_spfm(fmeda: pd.DataFrame) -> float:
     lam_spf = d.loc[d.get("Label","SAFE").str.upper()=="UNSAFE","FIT"].sum()
     return 1.0 if lam_total==0 else 1.0 - lam_spf/lam_total
 
-# ================= UI =================
+
+# ================================ UI ================================
 st.title("FMEDA Builder — KiCad schematic × Failure DB")
+
 safety_goal = st.text_input("Safety goal", "Prevent unintended output > 5 V")
 use_llm     = st.toggle("Use LLM for SAFE/UNSAFE classification", value=False)
 
@@ -260,6 +303,7 @@ with right:
 if sch_file:
     sch_text = sch_file.read().decode("utf-8", errors="ignore")
     comp_df = parse_kicad_sch_components(sch_text)
+
     st.subheader("Detected components (edit if needed)")
     comp_df = st.data_editor(
         comp_df[["RefDes","ComponentType","ct_norm"]].rename(columns={"ct_norm":"_norm (read-only)"}),
@@ -270,7 +314,10 @@ if sch_file:
 
     if fail_file:
         st.subheader("Failure DB preview & mapping")
-        failure_df = parse_failure_csv_with_mapping(fail_file)
+        failure_df, raw_df_debug, col_share_name, col_fit_name = parse_failure_csv_with_mapping(fail_file)
+
+        # Debug: show raw vs parsed numbers
+        debug_numeric_preview(raw_df_debug, col_share_name, col_fit_name)
 
         st.divider()
         if st.button("Build FMEDA table"):
@@ -288,7 +335,7 @@ if sch_file:
                 spfm = compute_spfm(fmeda)
                 st.metric("SPFM (approx.)", f"{spfm*100:.2f}%")
 
-            st.subheader("FMEDA result")
+            st.subheader("FMEDA result (RefDes first)")
             st.dataframe(fmeda, height=420)
 
             st.download_button("Download FMEDA (CSV)",
@@ -305,4 +352,3 @@ if sch_file:
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Upload a KiCad 9 schematic to start.")
-

@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import re, io, csv, json
 
-# ---------------------------- App config ----------------------------
+# ============================ App config ============================
 st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = "gpt-4o-mini"  # change if you like
 
-# Optional OpenAI client (only used if you toggle LLM)
+# Optional OpenAI (used only if you toggle LLM)
 try:
     from openai import OpenAI
     OAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
@@ -14,12 +14,12 @@ except Exception:
     OAI = None
 
 
-# ---------------------------- small utils ----------------------------
+# ============================ tiny utils ============================
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
 
 
-# ============================ KiCad 9 parser ============================
+# ============================ KiCad 9 schematic parser ============================
 REF_PREFIX = {
     "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
     "Q":"MOSFET","T":"BJT","U":"IC_Analog","A":"OpAmp","K":"Relay","F":"Fuse",
@@ -107,17 +107,17 @@ def parse_number_series(s: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
     v = s.astype(str).replace({"None":"", "none":"", "nan":""})
-    v = v.str.extract(_num_pat, expand=True)[0]
-    v = v.str.replace(",", ".", regex=False)
+    v = v.str.extract(_num_pat, expand=True)[0]          # captures '20' in 'FIT (Base FIT)=20'
+    v = v.str.replace(",", ".", regex=False)             # 12,3 -> 12.3
     return pd.to_numeric(v, errors="coerce")
 
 def parse_share_series(s: pd.Series) -> pd.Series:
-    raw = s.astype(str).replace({"None":"", "none":"", "nan":""})
+    raw  = s.astype(str).replace({"None":"", "none":"", "nan":""})
     nums = parse_number_series(raw)
     is_pct = raw.str.contains("%")
-    nums = nums.where(~is_pct, nums / 100.0)
+    nums = nums.where(~is_pct, nums / 100.0)             # '60%' -> 0.6
     maxv = pd.to_numeric(nums, errors="coerce").max(skipna=True)
-    if pd.notna(maxv) and maxv > 1.5:
+    if pd.notna(maxv) and maxv > 1.5:                    # bare '60' -> 0.6
         nums = nums / 100.0
     return nums
 
@@ -153,19 +153,30 @@ def parse_failure_csv_with_mapping(upload):
 
     st.write("CSV columns:", list(raw.columns))
 
+    # --- column detection (prefers your aliases) ---
+    FIT_ALIASES   = ["FIT (Base FIT)", "Base FIT", "FIT"]
+    SHARE_ALIASES = ["Share (Probability)", "Probability", "Share"]
+
+    def pick_by_alias(aliases, cols):
+        for a in aliases:
+            if a in cols:
+                return a
+        return None
+
     norm = {c: _norm(c) for c in raw.columns}
     def find_col(cands):
         for orig, n in norm.items():
-            if n in cands: return orig
+            if n in cands:
+                return orig
         return None
 
-    c_type = find_col({"componenttype","type","class","category","parttype","compclass"})
-    c_mode = find_col({"failuremode","mode","fm"})
-    c_share= find_col({"share","modeshare","distribution","percent","modesharepercent","modesharepct"})
-    c_fit  = find_col({"fit","lambda","rate","fitrate","lambdafit","lambdafitper1e9h"})
-    c_dc   = find_col({"dc","diagnosticcoverage","coverage","diagcoverage"})
-    c_det  = find_col({"detectable","detected","isdetected"})
-    c_dnm  = find_col({"diagnosticname","diag","diagnostic"})
+    c_fit   = pick_by_alias(FIT_ALIASES,   list(raw.columns)) or find_col({"fit","lambda","rate"})
+    c_share = pick_by_alias(SHARE_ALIASES, list(raw.columns)) or find_col({"share","percent","distribution"})
+    c_type  = find_col({"componenttype","type","class","category","parttype","compclass"})
+    c_mode  = find_col({"failuremode","mode","fm"})
+    c_dc    = find_col({"dc","diagnosticcoverage","coverage","diagcoverage"})
+    c_det   = find_col({"detectable","detected","isdetected"})
+    c_dnm   = find_col({"diagnosticname","diag","diagnostic"})
 
     missing = [n for n,c in {"Component Type":c_type,"Failure Mode":c_mode,"Mode Share":c_share,"FIT":c_fit}.items() if c is None]
     if missing:
@@ -182,7 +193,7 @@ def parse_failure_csv_with_mapping(upload):
         c_det=None if c_det=="<none>" else c_det
         c_dnm=None if not c_dnm else c_dnm
 
-    # canonicalize ComponentType cells like "Resistor;Passive;Fixed ..."
+    # canonicalize ComponentType cells like "Resistor;Passive;Fixed …"
     def canon_type_cell(s: str) -> str:
         parts = [p.strip() for p in str(s).split(";") if p.strip()]
         if not parts: return ""
@@ -209,11 +220,11 @@ def parse_failure_csv_with_mapping(upload):
     st.success("Failure DB parsed.")
     st.dataframe(out.head(20), height=240)
 
-    # return normalized + raw + the actual column names for debugging
+    # return normalized + raw + the chosen column names for debugging
     return out, raw, c_share, c_fit
 
 
-# --------------------------- Debug helper ---------------------------
+# ============================ Debug helper ============================
 def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n: int = 12):
     rs = raw_df[col_share].astype(str)
     rf = raw_df[col_fit].astype(str)
@@ -234,7 +245,7 @@ def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n:
     st.dataframe(dbg, height=240)
 
 
-# ============================ FMEDA expand ============================
+# ============================ FMEDA expand (keeps RefDes first) ============================
 def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.DataFrame:
     if "ct_norm" not in components_df.columns:
         components_df["ct_norm"] = components_df["ComponentType"].map(_norm)
@@ -257,7 +268,7 @@ def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.Da
     return out.sort_values(["RefDes","ComponentType"], kind="stable").reset_index(drop=True)
 
 
-# ============================ Optional LLM ============================
+# ============================ Optional LLM classification ============================
 def llm_classify_row(row: pd.Series, safety_goal: str):
     if OAI is None:
         return "NEEDS_REVIEW", "No OpenAI key configured."
@@ -288,11 +299,11 @@ def compute_spfm(fmeda: pd.DataFrame) -> float:
     return 1.0 if lam_total==0 else 1.0 - lam_spf/lam_total
 
 
-# ================================ UI ================================
+# ==================================== UI ====================================
 st.title("FMEDA Builder — KiCad schematic × Failure DB")
 
 safety_goal = st.text_input("Safety goal", "Prevent unintended output > 5 V")
-use_llm     = st.toggle("Use LLM for SAFE/UNSAFE classification", value=False)
+use_llm     = st.toggle("Use LLM for SAFE/UNSAFE classification", value=False, help="Needs OPENAI_API_KEY in secrets")
 
 left, right = st.columns([1,1])
 with left:
@@ -316,7 +327,7 @@ if sch_file:
         st.subheader("Failure DB preview & mapping")
         failure_df, raw_df_debug, col_share_name, col_fit_name = parse_failure_csv_with_mapping(fail_file)
 
-        # Debug: show raw vs parsed numbers
+        # Debug: raw vs parsed
         debug_numeric_preview(raw_df_debug, col_share_name, col_fit_name)
 
         st.divider()

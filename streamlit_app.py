@@ -4,9 +4,9 @@ import re, io, csv, json
 
 # ============================ App config ============================
 st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-OPENAI_MODEL = "gpt-4o-mini"  # change if you like
+OPENAI_MODEL = "gpt-4o"  # optional
 
-# Optional OpenAI (used only if you toggle LLM)
+# Optional OpenAI (only used if you enable LLM)
 try:
     from openai import OpenAI
     OAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
@@ -100,24 +100,23 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
 
 
 # ============================ Failure DB parsing ============================
-# robust number extractors (first numeric token in any text)
 _num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
 
 def parse_number_series(s: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
     v = s.astype(str).replace({"None":"", "none":"", "nan":""})
-    v = v.str.extract(_num_pat, expand=True)[0]          # captures '20' in 'FIT (Base FIT)=20'
-    v = v.str.replace(",", ".", regex=False)             # 12,3 -> 12.3
+    v = v.str.extract(_num_pat, expand=True)[0]
+    v = v.str.replace(",", ".", regex=False)
     return pd.to_numeric(v, errors="coerce")
 
 def parse_share_series(s: pd.Series) -> pd.Series:
     raw  = s.astype(str).replace({"None":"", "none":"", "nan":""})
     nums = parse_number_series(raw)
     is_pct = raw.str.contains("%")
-    nums = nums.where(~is_pct, nums / 100.0)             # '60%' -> 0.6
+    nums = nums.where(~is_pct, nums / 100.0)
     maxv = pd.to_numeric(nums, errors="coerce").max(skipna=True)
-    if pd.notna(maxv) and maxv > 1.5:                    # bare '60' -> 0.6
+    if pd.notna(maxv) and maxv > 1.5:
         nums = nums / 100.0
     return nums
 
@@ -151,11 +150,19 @@ def parse_failure_csv_with_mapping(upload):
         if tmp.shape[1] == len(cols):
             tmp.columns = cols; raw = tmp
 
-    st.write("CSV columns:", list(raw.columns))
+    # --- rename common variants so downstream code is trivial ---
+    rename_map = {}
+    cols_lower = {c.lower(): c for c in raw.columns}
+    if "probability" in cols_lower: rename_map[cols_lower["probability"]] = "Share"
+    if "base fit"    in cols_lower: rename_map[cols_lower["base fit"]]    = "FIT"
+    if "fit (base fit)" in cols_lower: rename_map[cols_lower["fit (base fit)"]] = "FIT"
+    raw.rename(columns=rename_map, inplace=True)
 
-    # --- column detection (prefers your aliases) ---
-    FIT_ALIASES   = ["FIT (Base FIT)", "Base FIT", "FIT"]
-    SHARE_ALIASES = ["Share (Probability)", "Probability", "Share"]
+    st.write("CSV columns (after rename if any):", list(raw.columns))
+
+    # column detection (prefer exact names now that we renamed)
+    FIT_ALIASES   = ["FIT", "FIT (Base FIT)", "Base FIT"]
+    SHARE_ALIASES = ["Share", "Share (Probability)", "Probability"]
 
     def pick_by_alias(aliases, cols):
         for a in aliases:
@@ -193,12 +200,13 @@ def parse_failure_csv_with_mapping(upload):
         c_det=None if c_det=="<none>" else c_det
         c_dnm=None if not c_dnm else c_dnm
 
-    # canonicalize ComponentType cells like "Resistor;Passive;Fixed …"
+    # canonicalize ComponentType like "Resistor;Passive;Fixed …"
     def canon_type_cell(s: str) -> str:
         parts = [p.strip() for p in str(s).split(";") if p.strip()]
         if not parts: return ""
         base = {"resistor","capacitor","capacitor_polarized","inductor","diode","zener",
-                "bjt","mosfet","opamp","comparator","relay","fuse","connector"}
+                "bjt","mosfet","opamp","comparator","relay","fuse","connector",
+                "voltageregulator","microcontroller"}
         for p in parts:
             if _norm(p) in base: return p.capitalize()
         return parts[0]
@@ -220,7 +228,6 @@ def parse_failure_csv_with_mapping(upload):
     st.success("Failure DB parsed.")
     st.dataframe(out.head(20), height=240)
 
-    # return normalized + raw + the chosen column names for debugging
     return out, raw, c_share, c_fit
 
 
@@ -292,11 +299,12 @@ Return JSON only: {{"label":"SAFE|UNSAFE|NEEDS_REVIEW","reason":"<short>"}}"""
         return "NEEDS_REVIEW", f"LLM error: {e}"
 
 def compute_spfm(fmeda: pd.DataFrame) -> float:
-    d = fmeda.dropna(subset=["FIT"])
-    if d.empty: return 1.0
-    lam_total = d["FIT"].sum()
-    lam_spf = d.loc[d.get("Label","SAFE").str.upper()=="UNSAFE","FIT"].sum()
-    return 1.0 if lam_total==0 else 1.0 - lam_spf/lam_total
+    d = fmeda.copy()
+    if "FIT_eff" not in d.columns:
+        d["FIT_eff"] = pd.to_numeric(d["FIT"], errors="coerce").fillna(0.0)
+    lam_total = d["FIT_eff"].sum()
+    lam_spf   = d.loc[d.get("Label","SAFE").str.upper()=="UNSAFE", "FIT_eff"].sum()
+    return 1.0 if lam_total == 0 else 1.0 - lam_spf/lam_total
 
 
 # ==================================== UI ====================================
@@ -333,6 +341,27 @@ if sch_file:
         st.divider()
         if st.button("Build FMEDA table"):
             fmeda = expand_fmeda(comp_df, failure_df)
+
+            # Fill missing Share inside each RefDes group (equal split)
+            fmeda["Share"] = pd.to_numeric(fmeda["Share"], errors="coerce")
+            mask_na = fmeda["Share"].isna()
+            if mask_na.any():
+                eq = (
+                    fmeda[mask_na]
+                    .groupby(["RefDes","ComponentType"], dropna=False)["Share"]
+                    .transform(lambda s: 1.0 / len(s) if len(s) else 1.0)
+                )
+                fmeda.loc[mask_na, "Share"] = eq
+
+            # DC defaults to 0
+            fmeda["DC"] = pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0).clip(0,1)
+
+            # Effective FIT (per failure mode)
+            fmeda["FIT_eff"] = (
+                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(0.0)
+                * fmeda["Share"].astype(float)
+                * (1.0 - fmeda["DC"].astype(float))
+            )
 
             if use_llm:
                 labels=[]; reasons=[]

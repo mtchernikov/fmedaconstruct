@@ -13,11 +13,16 @@ try:
 except Exception:
     OAI = None
 
+# Optional Excel export dependency
+try:
+    import xlsxwriter  # noqa: F401
+    EXCEL_ENABLED = True
+except Exception:
+    EXCEL_ENABLED = False
 
 # ---------------------------- helpers ----------------------------
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
-
 
 # ============================ KiCad 9 schematic parser ============================
 REF_PREFIX = {
@@ -97,7 +102,6 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
     df.loc[df["RefDes"] == "?", "ComponentType"] = "unknown component"
     df["ct_norm"] = df["ComponentType"].map(_norm)
     return df[["RefDes","ComponentType","ct_norm"]]
-
 
 # ============================ Failure DB parsing ============================
 _num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
@@ -242,7 +246,6 @@ def parse_failure_csv_with_mapping(upload):
 
     return out, raw, c_share, c_fit
 
-
 # --------------------------- Debug helper ---------------------------
 def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n: int = 12):
     rs = raw_df[col_share].astype(str)
@@ -262,7 +265,6 @@ def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n:
     }, index=idx)
     st.write("🔎 Parsing samples (first non-empty rows):")
     st.dataframe(dbg, height=240)
-
 
 # ============================ FMEDA expand (keeps RefDes first) ============================
 def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.DataFrame:
@@ -285,7 +287,6 @@ def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.Da
         "DiagnosticName":merged["DiagnosticName"].where(~unknown, "")
     })
     return out.sort_values(["RefDes","ComponentType"], kind="stable").reset_index(drop=True)
-
 
 # ============================ Optional LLM ============================
 def llm_classify_row(row: pd.Series, safety_goal: str):
@@ -318,12 +319,11 @@ def compute_spfm(fmeda: pd.DataFrame) -> float:
     lam_spf   = d.loc[d.get("Label","SAFE").str.upper()=="UNSAFE", "FIT_eff"].sum()
     return 1.0 if lam_total == 0 else 1.0 - lam_spf/lam_total
 
-
 # ==================================== UI ====================================
 st.title("FMEDA Builder — KiCad schematic × Failure DB")
 
 safety_goal = st.text_input("Safety goal", "Prevent unintended output > 5 V")
-use_llm     = st.toggle("Use LLM for SAFE/UNSAFE classification", value=False, help="Needs OPENAI_API_KEY in secrets")
+use_llm     = st.toggle("Use LLM for SAFE/UNSAFE classification", value=False, help="Needs OPENAI_APIKEY in secrets")
 
 left, right = st.columns([1,1])
 with left:
@@ -390,17 +390,24 @@ if sch_file:
             st.subheader("FMEDA result (RefDes first)")
             st.dataframe(fmeda, height=420)
 
+            # CSV download
             st.download_button("Download FMEDA (CSV)",
                                fmeda.to_csv(index=False).encode("utf-8"),
                                "fmeda_results.csv","text/csv")
 
-            xbuf = io.BytesIO()
-            with pd.ExcelWriter(xbuf, engine="xlsxwriter") as xw:
-                fmeda.to_excel(xw, index=False, sheet_name="FMEDA")
-                pd.DataFrame([{"SafetyGoal":safety_goal, "LLM": use_llm}]).to_excel(xw, index=False, sheet_name="Summary")
-            st.download_button("Download FMEDA (XLSX)",
-                               xbuf.getvalue(),
-                               "fmeda_results.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            # Excel download (safe fallback)
+            if EXCEL_ENABLED:
+                xbuf = io.BytesIO()
+                with pd.ExcelWriter(xbuf, engine="xlsxwriter") as xw:
+                    fmeda.to_excel(xw, index=False, sheet_name="FMEDA")
+                    pd.DataFrame([{"SafetyGoal":safety_goal, "LLM": use_llm}]) \
+                        .to_excel(xw, index=False, sheet_name="Summary")
+                st.download_button("Download FMEDA (XLSX)",
+                                   xbuf.getvalue(),
+                                   "fmeda_results.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.info("Excel export is disabled (package `xlsxwriter` not installed). "
+                        "Install it to enable XLSX downloads: `pip install xlsxwriter`")
 else:
     st.info("Upload a KiCad 9 schematic to start.")

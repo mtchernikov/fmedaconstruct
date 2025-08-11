@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import re, io, csv, json
 
-# ============================ App config ============================
+# ---------------------------- App config ----------------------------
 st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-OPENAI_MODEL = "gpt-4o-mini"  # optional
+OPENAI_MODEL = "gpt-4o-mini"  # optional; only used when toggled
 
-# Optional OpenAI (only used if you enable LLM)
+# Optional OpenAI client (needs st.secrets["OPENAI_API_KEY"])
 try:
     from openai import OpenAI
     OAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
@@ -14,7 +14,7 @@ except Exception:
     OAI = None
 
 
-# ============================ tiny utils ============================
+# ---------------------------- helpers ----------------------------
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
 
@@ -120,6 +120,24 @@ def parse_share_series(s: pd.Series) -> pd.Series:
         nums = nums / 100.0
     return nums
 
+def auto_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Auto-map Probability/Share and FIT variants to canonical names."""
+    ren = {}
+    have_share = any(_norm(c) == "share" for c in df.columns)
+    have_fit   = any(_norm(c) == "fit"   for c in df.columns)
+
+    for c in df.columns:
+        n = _norm(c)  # e.g. "probability(%)" -> "probability"
+        if not have_share:
+            if ("probabil" in n) or (n in {"probability","probabilitypct","probabilitypercent"}) or ("share" in n):
+                ren[c] = "Share"
+                have_share = True
+        if not have_fit:
+            if n in {"fit","basefit","fitbasefit","lambdafit","lambda","failurerate","rate"}:
+                ren[c] = "FIT"
+                have_fit = True
+    return df.rename(columns=ren) if ren else df
+
 def parse_failure_csv_with_mapping(upload):
     """Return: (normalized_table, raw_dataframe, share_col_name, fit_col_name)"""
     raw_bytes = upload.read(); upload.seek(0)
@@ -150,15 +168,9 @@ def parse_failure_csv_with_mapping(upload):
         if tmp.shape[1] == len(cols):
             tmp.columns = cols; raw = tmp
 
-    # --- rename common variants so downstream code is trivial ---
-    rename_map = {}
-    cols_lower = {c.lower(): c for c in raw.columns}
-    if "probability" in cols_lower: rename_map[cols_lower["probability"]] = "Share"
-    if "base fit"    in cols_lower: rename_map[cols_lower["base fit"]]    = "FIT"
-    if "fit (base fit)" in cols_lower: rename_map[cols_lower["fit (base fit)"]] = "FIT"
-    raw.rename(columns=rename_map, inplace=True)
-
-    st.write("CSV columns (after rename if any):", list(raw.columns))
+    # auto-rename common variants
+    raw = auto_rename_columns(raw)
+    st.write("CSV columns (auto-renamed if needed):", list(raw.columns))
 
     # column detection (prefer exact names now that we renamed)
     FIT_ALIASES   = ["FIT", "FIT (Base FIT)", "Base FIT"]
@@ -185,27 +197,20 @@ def parse_failure_csv_with_mapping(upload):
     c_det   = find_col({"detectable","detected","isdetected"})
     c_dnm   = find_col({"diagnosticname","diag","diagnostic"})
 
-    # ---------------- sanity check + forced remap if wrong ----------------
-    def _col_has_numbers(df, col):
-        if col is None or col not in df.columns:
-            return False
-        return df[col].astype(str).str.contains(r'\d').any()
-
-    bad_share = (c_share is None) or (not _col_has_numbers(raw, c_share))
-    bad_fit   = (c_fit   is None) or (not _col_has_numbers(raw, c_fit))
-
-    if not bad_share and c_type and (c_type in raw.columns):
-        same = raw[c_share].astype(str).head(50).equals(raw[c_type].astype(str).head(50))
-        bad_share = bad_share or same
-
-    if bad_share or bad_fit:
-        st.error("The selected columns for **Share** and/or **FIT** do not contain numbers. Please map them explicitly.")
+    missing = [n for n,c in {"Component Type":c_type,"Failure Mode":c_mode,"Mode Share":c_share,"FIT":c_fit}.items() if c is None]
+    if missing:
+        st.warning("Map missing CSV columns:")
         cols = list(raw.columns)
-        def idx(name):
-            try: return cols.index(name)
-            except: return 0
-        c_share = st.selectbox("Mode Share / Probability column", cols, index=idx(c_share if c_share in cols else "Share"))
-        c_fit   = st.selectbox("FIT column",                        cols, index=idx(c_fit   if c_fit   in cols else "FIT"))
+        c_type = st.selectbox("Component Type column", cols, index=0 if c_type is None else cols.index(c_type))
+        c_mode = st.selectbox("Failure Mode column",  cols, index=0 if c_mode is None else cols.index(c_mode))
+        c_share= st.selectbox("Mode Share column",    cols, index=0 if c_share is None else cols.index(c_share))
+        c_fit  = st.selectbox("FIT column",           cols, index=0 if c_fit is None else cols.index(c_fit))
+        c_dc   = st.selectbox("Diagnostic Coverage (optional)", ["<none>"]+cols, index=0)
+        c_det  = st.selectbox("Detectable (optional)",          ["<none>"]+cols, index=0)
+        c_dnm  = st.text_input("Diagnostic Name (optional)", value=c_dnm or "")
+        c_dc=None if c_dc=="<none>" else c_dc
+        c_det=None if c_det=="<none>" else c_det
+        c_dnm=None if not c_dnm else c_dnm
 
     # canonicalize ComponentType like "Resistor;Passive;Fixed …"
     def canon_type_cell(s: str) -> str:
@@ -238,7 +243,7 @@ def parse_failure_csv_with_mapping(upload):
     return out, raw, c_share, c_fit
 
 
-# ============================ Debug helper ============================
+# --------------------------- Debug helper ---------------------------
 def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n: int = 12):
     rs = raw_df[col_share].astype(str)
     rf = raw_df[col_fit].astype(str)
@@ -282,7 +287,7 @@ def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.Da
     return out.sort_values(["RefDes","ComponentType"], kind="stable").reset_index(drop=True)
 
 
-# ============================ Optional LLM classification ============================
+# ============================ Optional LLM ============================
 def llm_classify_row(row: pd.Series, safety_goal: str):
     if OAI is None:
         return "NEEDS_REVIEW", "No OpenAI key configured."

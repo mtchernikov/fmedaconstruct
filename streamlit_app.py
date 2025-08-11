@@ -4,7 +4,7 @@ import re, io, csv, json
 
 # ============================ App config ============================
 st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-OPENAI_MODEL = "gpt-4o"  # optional
+OPENAI_MODEL = "gpt-4o-mini"  # optional
 
 # Optional OpenAI (only used if you enable LLM)
 try:
@@ -185,20 +185,27 @@ def parse_failure_csv_with_mapping(upload):
     c_det   = find_col({"detectable","detected","isdetected"})
     c_dnm   = find_col({"diagnosticname","diag","diagnostic"})
 
-    missing = [n for n,c in {"Component Type":c_type,"Failure Mode":c_mode,"Mode Share":c_share,"FIT":c_fit}.items() if c is None]
-    if missing:
-        st.warning("Map missing CSV columns:")
+    # ---------------- sanity check + forced remap if wrong ----------------
+    def _col_has_numbers(df, col):
+        if col is None or col not in df.columns:
+            return False
+        return df[col].astype(str).str.contains(r'\d').any()
+
+    bad_share = (c_share is None) or (not _col_has_numbers(raw, c_share))
+    bad_fit   = (c_fit   is None) or (not _col_has_numbers(raw, c_fit))
+
+    if not bad_share and c_type and (c_type in raw.columns):
+        same = raw[c_share].astype(str).head(50).equals(raw[c_type].astype(str).head(50))
+        bad_share = bad_share or same
+
+    if bad_share or bad_fit:
+        st.error("The selected columns for **Share** and/or **FIT** do not contain numbers. Please map them explicitly.")
         cols = list(raw.columns)
-        c_type = st.selectbox("Component Type column", cols, index=0 if c_type is None else cols.index(c_type))
-        c_mode = st.selectbox("Failure Mode column",  cols, index=0 if c_mode is None else cols.index(c_mode))
-        c_share= st.selectbox("Mode Share column",    cols, index=0 if c_share is None else cols.index(c_share))
-        c_fit  = st.selectbox("FIT column",           cols, index=0 if c_fit is None else cols.index(c_fit))
-        c_dc   = st.selectbox("Diagnostic Coverage (optional)", ["<none>"]+cols, index=0)
-        c_det  = st.selectbox("Detectable (optional)",          ["<none>"]+cols, index=0)
-        c_dnm  = st.text_input("Diagnostic Name (optional)", value=c_dnm or "")
-        c_dc=None if c_dc=="<none>" else c_dc
-        c_det=None if c_det=="<none>" else c_det
-        c_dnm=None if not c_dnm else c_dnm
+        def idx(name):
+            try: return cols.index(name)
+            except: return 0
+        c_share = st.selectbox("Mode Share / Probability column", cols, index=idx(c_share if c_share in cols else "Share"))
+        c_fit   = st.selectbox("FIT column",                        cols, index=idx(c_fit   if c_fit   in cols else "FIT"))
 
     # canonicalize ComponentType like "Resistor;Passive;Fixed …"
     def canon_type_cell(s: str) -> str:

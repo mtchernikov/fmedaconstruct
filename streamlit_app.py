@@ -4,7 +4,7 @@ import re, io, csv, json
 
 # ---------------------------- App config ----------------------------
 st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-OPENAI_MODEL = "gpt-4o-mini"  # optional; only used when toggled
+OPENAI_MODEL = "gpt-4o"  # optional; only used when toggled
 
 # Optional OpenAI client (needs st.secrets["OPENAI_API_KEY"])
 try:
@@ -411,3 +411,4 @@ if sch_file:
                         "Install it to enable XLSX downloads: `pip install xlsxwriter`")
 else:
     st.info("Upload a KiCad 9 schematic to start.")
+

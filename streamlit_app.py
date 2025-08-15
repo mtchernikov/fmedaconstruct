@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import re, io, csv, json
 from collections import defaultdict
+from time import sleep
 
 # ============================ App config ============================
-st.set_page_config(page_title="FMEDA (KiCad .net) — Rules vs LLM", layout="wide")
-OPENAI_MODEL = "gpt-4o"  # only used if LLM comparison is enabled
+st.set_page_config(page_title="FMEDA (KiCad .net) — LLM only", layout="wide")
+OPENAI_MODEL = "gpt-4o"  # requires OPENAI_API_KEY in Streamlit secrets
 
-# Optional OpenAI client (LLM is optional)
+# Optional OpenAI client
 try:
     from openai import OpenAI
     OAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
@@ -21,7 +22,8 @@ try:
 except Exception:
     EXCEL_ENABLED = False
 
-# ============================ Small utils ============================
+
+# ============================ Utils ============================
 _num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
@@ -44,56 +46,30 @@ def parse_share_series(s: pd.Series) -> pd.Series:
         nums = nums / 100.0
     return nums
 
+
 # ============================ S-expression helpers ============================
-def _iter_blocks(text: str, tag: str):
-    """Yield s-expr blocks starting with '({tag}' at balanced parens depth."""
-    needle = f"({tag}"
-    i = text.find(needle)
-    n = len(text)
-    while i != -1:
-        depth = 0; start = i; j = i
+def iter_blocks_exact(text: str, tag: str):
+    """Yield balanced s-expr blocks starting with '({tag} ' or '({tag}(' ."""
+    pat = re.compile(r'\(' + re.escape(tag) + r'(?=[\s\()])')
+    for m in pat.finditer(text):
+        i = m.start()
+        depth = 0; j = i; n = len(text)
         while j < n:
             ch = text[j]
-            if ch == "(": depth += 1
+            if ch == "(":
+                depth += 1
             elif ch == ")":
                 depth -= 1
                 if depth == 0:
-                    yield text[start:j+1]; break
+                    yield text[i:j+1]
+                    break
             j += 1
-        i = text.find(needle, j)
 
-# ============================ Type inference ============================
-REF_PREFIX = {
-    "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
-    "Q":"MOSFET","T":"BJT","U":"IC","A":"OpAmp","K":"Relay","F":"Fuse",
-    "J":"Connector","X":"Connector",
-}
-def infer_type_from_ref_or_value(ref: str, value: str) -> str:
-    m = re.match(r'^([A-Za-z]+)', ref or "")
-    if m:
-        pref = m.group(1).upper()
-        for p in sorted(REF_PREFIX, key=lambda x: -len(x)):
-            if pref.startswith(p): return REF_PREFIX[p]
-    t = (value or "").lower()
-    if re.search(r'(^|\s)\d+(\.\d+)?(r|k|m)?(\s*ohm|$)', t): return "Resistor"
-    if re.search(r'(^|\s)\d+(\.\d+)?(n|u|µ|p|f)(\s*|$)', t): return "Capacitor"
-    if "opamp" in t: return "OpAmp"
-    if "comparator" in t or "comp" in t: return "Comparator"
-    if "mos" in t or "nmos" in t or "pmos" in t: return "MOSFET"
-    if "diode" in t or t.startswith("1n") or t.startswith("sb"): return "Diode"
-    return "Other"
-
-# ============================ NET parser (S-expression + XML fallback; quoted-safe) ============================
 def _token_alt(key):
     # matches (key "X") or (key X)
     return rf'\({key}\s+("([^"]+)"|[^\s\)]+)\)'
 
 def _pick(m, quoted_idx=2, any_idx=1):
-    """
-    Safely pick a capture from a regex Match:
-    - prefer the quoted capture (e.g., group 2) else the unquoted token (group 1)
-    - return "" if neither exists (avoids calling .strip on None)
-    """
     if m is None:
         return ""
     try:
@@ -109,18 +85,35 @@ def _pick(m, quoted_idx=2, any_idx=1):
         return ""
     return val.strip('"')
 
+
+# ============================ NET parser (S-exp + XML) ============================
+REF_PREFIX = {
+    "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
+    "Q":"Transistor","T":"Transistor","U":"IC","A":"OpAmp","K":"Relay","F":"Fuse",
+    "J":"Connector","X":"Connector",
+}
+def infer_type(ref: str, value: str) -> str:
+    m = re.match(r'^([A-Za-z]+)', ref or "")
+    base = "Other"
+    if m:
+        pref = m.group(1).upper()
+        for p in sorted(REF_PREFIX, key=lambda x: -len(x)):
+            if pref.startswith(p): base = REF_PREFIX[p]; break
+    v = (value or "").lower()
+    if base=="Transistor":
+        if "mos" in v or "nmos" in v or "pmos" in v: return "MOSFET"
+        if "npn" in v or "pnp" in v: return "BJT"
+        return "MOSFET" if (ref or "").upper().startswith("Q") else "BJT"
+    if base=="IC" and ("opamp" in v or "lm" in v):
+        return "OpAmp"
+    if "diode" in v or v.startswith("1n") or v.startswith("sb"):
+        return "Diode"
+    return base
+
 def parse_kicad_net(net_bytes: bytes):
-    """
-    Supports KiCad 6/7/8/9 .net in S-expression and XML.
-    Returns:
-      nets:          dict[str, set[(ref,pin)]]
-      comp_pins_map: dict[ref] -> set(pin)
-      pin_name_map:  dict[(ref,pin)] -> {"name": str, "type": str}
-      ref_types:     dict[ref] -> inferred component type
-    """
     text = net_bytes.decode("utf-8", errors="ignore").strip()
 
-    # ---------- XML path ----------
+    # XML path
     if text.startswith("<"):
         import xml.etree.ElementTree as ET
         root = ET.fromstring(text)
@@ -133,8 +126,8 @@ def parse_kicad_net(net_bytes: bytes):
         for comp in root.findall(".//components/comp"):
             ref = comp.get("ref") or ""
             if not ref: continue
-            val = (comp.findtext("./value") or "").strip().lower()
-            ref_types[ref] = infer_type_from_ref_or_value(ref, val)
+            val = (comp.findtext("./value") or "")
+            ref_types[ref] = infer_type(ref, val)
             ls = comp.find("./libsource")
             if ls is not None:
                 ref_to_libpart[ref] = (ls.get("lib") or "", ls.get("part") or "")
@@ -166,36 +159,33 @@ def parse_kicad_net(net_bytes: bytes):
 
         return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
 
-    # ---------- S-expression path (quoted-safe) ----------
+    # S-expression path
     nets = defaultdict(set)
     comp_pins = defaultdict(set)
     pin_name_map = {}
-    ref_types = {}
+    ref_values = {}
 
-    # components: references + values (for type inference)
-    for comp_blk in _iter_blocks(text, "comp"):
+    for comp_blk in iter_blocks_exact(text, "comp"):
         m_ref = re.search(_token_alt("ref"), comp_blk)
         if not m_ref: continue
         ref = _pick(m_ref)
         m_val = re.search(r'\(value\s+("([^"]+)"|[^\s\)]+)\)', comp_blk)
         val = _pick(m_val) if m_val else ""
-        ref_types[ref] = infer_type_from_ref_or_value(ref, val)
+        ref_values[ref] = val
 
-    # nets → nodes (capture optional pinfunction/pintype)
     node_re = re.compile(
         rf'\(node\s+{_token_alt("ref")}\s+{_token_alt("pin")}'
         r'(?:\s+\(pinfunction\s+("([^"]+)"|[^\s\)]+)\))?'
         r'(?:\s+\(pintype\s+("([^"]+)"|[^\s\)]+)\))?'
         r'\s*\)'
     )
-    for net_blk in _iter_blocks(text, "net"):
-        m_name = re.search(r'\(name\s+("([^"]+)"|[^\s\)]+)\)', net_blk)
+    for nb in iter_blocks_exact(text, "net"):
+        m_name = re.search(r'\(name\s+("([^"]+)"|[^\s\)]+)\)', nb)
         net_name = _pick(m_name) if m_name else ""
-        for nm in node_re.finditer(net_blk):
+        for nm in node_re.finditer(nb):
             ref = _pick(nm, quoted_idx=2, any_idx=1)
             pin = _pick(nm, quoted_idx=4, any_idx=3)
-            if not ref or not pin:
-                continue
+            if not ref or not pin: continue
             nets[net_name].add((ref, pin))
             comp_pins[ref].add(pin)
             pfunc = _pick(nm, quoted_idx=6, any_idx=5)
@@ -203,7 +193,9 @@ def parse_kicad_net(net_bytes: bytes):
             if pfunc or ptype:
                 pin_name_map[(ref, pin)] = {"name": pfunc, "type": ptype}
 
+    ref_types = {ref: infer_type(ref, ref_values.get(ref,"")) for ref in comp_pins.keys()}
     return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
+
 
 def invert_node_to_net(nets: dict[str,set[tuple]]):
     node2net = {}
@@ -211,6 +203,7 @@ def invert_node_to_net(nets: dict[str,set[tuple]]):
         for node in nodes:
             node2net[node] = net_name
     return node2net
+
 
 # ============================ Failure DB parsing ============================
 def auto_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -305,7 +298,7 @@ def parse_failure_csv_with_mapping(upload):
     out["FailureMode"]   = raw[c_mode].astype(str).fillna("").str.strip()
     out["Share"]         = parse_share_series(raw[c_share])
     out["FIT"]           = parse_number_series(raw[c_fit])
-    out["DC"]            = parse_number_series(raw[c_dc]).fillna(0.0).clip(0,1) if c_dc else 0.0
+    out["DC"]            = parse_share_series(raw[c_dc]).clip(0,1) if c_dc else 0.0
     if c_det:
         v = raw[c_det].astype(str).str.strip().str.lower()
         out["Detectable"] = v.isin(["1","true","yes","y","t"])
@@ -318,228 +311,30 @@ def parse_failure_csv_with_mapping(upload):
     st.dataframe(out.head(20), height=240)
     return out, raw, c_share, c_fit
 
-def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n: int = 12):
-    rs = raw_df[col_share].astype(str)
-    rf = raw_df[col_fit].astype(str)
-    ps = parse_share_series(rs)
-    pf = parse_number_series(rf)
-    mask = rs.replace({"None":"", "nan":""}).str.strip().ne("") | rf.replace({"None":"", "nan":""}).str.strip().ne("")
-    idx = raw_df.index[mask][:n]
-    dbg = pd.DataFrame({
-        "Share_raw":  rs.loc[idx].values,
-        "Share_parsed": ps.loc[idx].values,
-        "FIT_raw":    rf.loc[idx].values,
-        "FIT_parsed": pf.loc[idx].values,
-    }, index=idx)
-    st.write("🔎 Parsing samples (first non-empty rows):")
-    st.dataframe(dbg, height=240)
 
-# ============================ Supplies & thresholds ============================
-SUPPLY_DEFAULTS = {
-    "vcc": 5.0, "vdd": 5.0, "vin": 12.0, "vbatt": 12.0, "vbat": 12.0,
-    "+5v": 5.0, "5v": 5.0, "3v3": 3.3, "3.3v": 3.3, "+3v3": 3.3, "+12v": 12.0, "12v": 12.0,
-    "avcc": 5.0, "dvcc": 5.0
-}
-def voltage_from_netname(name: str) -> float | None:
-    if not name: return None
-    n = _norm(name)
-    if n in SUPPLY_DEFAULTS: return SUPPLY_DEFAULTS[n]
-    m = re.search(r'(\d+(?:\.\d+)?)v', n)  # 5v, 12v
-    if m:
-        try: return float(m.group(1))
-        except Exception: pass
-    m2 = re.search(r'(\d)v(\d)', n)  # 3v3
-    if m2:
-        return float(f"{m2.group(1)}.{m2.group(2)}")
-    return None
+# ============================ Build components from NET ============================
+def build_component_table_from_net(comp_pins_map: dict, ref_types: dict) -> pd.DataFrame:
+    rows = []
+    def ref_sort_key(r: str):
+        m = re.search(r'(\d+)$', r)
+        return (re.sub(r'\d+$', '', r), int(m.group(1)) if m else 0)
+    for ref in sorted(comp_pins_map.keys(), key=ref_sort_key):
+        rows.append({"RefDes": ref, "ComponentType": ref_types.get(ref, "Other")})
+    df = pd.DataFrame(rows, columns=["RefDes","ComponentType"])
+    df["ct_norm"] = df["ComponentType"].map(_norm)
+    return df
 
-def extract_threshold_from_goal(text: str, default: float = 5.0) -> float:
-    if not text: return default
-    m = re.search(r'(\d+(?:\.\d+)?)\s*v', text.lower())
-    return float(m.group(1)) if m else default
 
-# ============================ Pin helpers ============================
-def pin_name(pinfo):  return (pinfo or {}).get("name","")
-def net_of(node2net, ref, pin): return node2net.get((ref, str(pin)))
-
-def find_by_pin_names(pin_name_map, ref, names_like):
-    want = {s.lower() for s in names_like}
-    out = set()
-    for (r,p), info in pin_name_map.items():
-        if r != ref: continue
-        nm = pin_name(info).lower()
-        if nm in want or any(nm.startswith(w) for w in want):
-            out.add(p)
-    return out
-
-def diode_pins(pin_name_map, ref):
-    a = find_by_pin_names(pin_name_map, ref, ["a","anode"])
-    k = find_by_pin_names(pin_name_map, ref, ["k","cathode"])
-    return a, k
-
-def mosfet_pins(pin_name_map, ref):
-    d = find_by_pin_names(pin_name_map, ref, ["d","drain"])
-    s = find_by_pin_names(pin_name_map, ref, ["s","source"])
-    g = find_by_pin_names(pin_name_map, ref, ["g","gate"])
-    return d, s, g
-
-def bjt_pins(pin_name_map, ref):
-    c = find_by_pin_names(pin_name_map, ref, ["c","collector"])
-    e = find_by_pin_names(pin_name_map, ref, ["e","emitter"])
-    b = find_by_pin_names(pin_name_map, ref, ["b","base"])
-    return c, e, b
-
-def supply_pins(pin_name_map, ref):
-    tokens = ["vcc","vdd","vss","vee","v+","v-","avcc","dvcc","vref","vref+","vref-","vbat"]
-    return find_by_pin_names(pin_name_map, ref, tokens)
-
-def output_pins(pin_name_map, ref):
-    return find_by_pin_names(pin_name_map, ref, ["out","vo","vout"])
-
-# ============================ Deterministic propagation (NET-only) ============================
-def failure_creates_short(failure_mode: str) -> bool:
-    if not isinstance(failure_mode, str): return False
-    fm = failure_mode.lower()
-    return any(k in fm for k in ["short", "s/c", "sc"])
-
-def failure_is_open(failure_mode: str) -> bool:
-    if not isinstance(failure_mode, str): return False
-    fm = failure_mode.lower()
-    return any(k in fm for k in ["open", "o/c", "oc"])
-
-def failure_short_to_named(failure_mode: str) -> str | None:
-    if not isinstance(failure_mode, str): return None
-    fm = failure_mode.lower()
-    m = re.search(r'short\s*(to|2)\s*([a-z0-9\+\-\.]+)', fm)
-    return m.group(2) if m else None
-
-def comp_is_two_terminal(comp_pins_map, ref) -> bool:
-    return len(comp_pins_map.get(ref, set())) == 2
-
-def label_rules(row, nets, comp_pins_map, pin_name_map, node2net,
-                target_net: str, hazard_v: float):
-    ref   = str(row["RefDes"])
-    ctype = (row.get("ComponentType") or "").lower()
-    fm    = (row.get("FailureMode") or "").lower()
-
-    if ref not in comp_pins_map:
-        return "UNASSESSED", "Component not in netlist (NET-only mode)"
-    if target_net not in nets:
-        return "UNASSESSED", f"Target net '{target_net}' not found"
-
-    if failure_is_open(fm):
-        return "SAFE", "Open fault cannot raise target voltage (overvoltage goal)"
-    if not failure_creates_short(fm):
-        return "NEEDS_REVIEW", "Non-short failure not modeled; manual review"
-
-    def pins_bridge_high_to_target(pinsA, pinsB):
-        for pa in pinsA:
-            na = net_of(node2net, ref, pa)
-            if not na: continue
-            va = voltage_from_netname(na)
-            if va is None or va < hazard_v: continue
-            for pb in pinsB:
-                nb = net_of(node2net, ref, pb)
-                if nb == target_net:
-                    return True, f"Short connects {na} ({va:.2f}V) to {target_net}"
-        return False, ""
-
-    named = failure_short_to_named(fm)
-    if named:
-        v_named = voltage_from_netname(named)
-        if v_named is None and _norm(named) in {"gnd","ground","0v"}:
-            v_named = 0.0
-        if v_named is not None and v_named >= hazard_v:
-            if any(net_of(node2net, ref, p) == target_net for p in comp_pins_map.get(ref, [])):
-                return "UNSAFE", f"Explicit '{row['FailureMode']}' injects {v_named:.2f}V into {target_net}"
-
-    if "diode" in ctype or "zener" in ctype:
-        a, k = diode_pins(pin_name_map, ref)
-        if a and k:
-            hit, why = pins_bridge_high_to_target(a, k)
-            if hit: return "UNSAFE", f"Diode A-K short: {why}"
-            hit, why = pins_bridge_high_to_target(k, a)
-            if hit: return "UNSAFE", f"Diode K-A short: {why}"
-        if comp_is_two_terminal(comp_pins_map, ref):
-            pins = list(comp_pins_map[ref])
-            n0, n1 = net_of(node2net, ref, pins[0]), net_of(node2net, ref, pins[1])
-            other  = n1 if n0 == target_net else n0
-            v      = voltage_from_netname(other)
-            if (n0 == target_net or n1 == target_net) and (v is not None and v >= hazard_v):
-                return "UNSAFE", f"Two-terminal short bridges {v:.2f}V to {target_net}"
-        return "SAFE", "No high-rail-to-target bridge for diode short"
-
-    if "mosfet" in ctype:
-        d, s, g = mosfet_pins(pin_name_map, ref)
-        if d and s:
-            hit, why = pins_bridge_high_to_target(d, s)
-            if hit: return "UNSAFE", f"MOSFET D-S short: {why}"
-            hit, why = pins_bridge_high_to_target(s, d)
-            if hit: return "UNSAFE", f"MOSFET S-D short: {why}"
-        return "NEEDS_REVIEW", "MOSFET short not clearly D-S; review"
-
-    if "bjt" in ctype:
-        c, e, b = bjt_pins(pin_name_map, ref)
-        if c and e:
-            hit, why = pins_bridge_high_to_target(c, e)
-            if hit: return "UNSAFE", f"BJT C-E short: {why}"
-            hit, why = pins_bridge_high_to_target(e, c)
-            if hit: return "UNSAFE", f"BJT E-C short: {why}"
-        return "NEEDS_REVIEW", "BJT short not clearly C-E; review"
-
-    if "opamp" in ctype or "comparator" in ctype:
-        outs = output_pins(pin_name_map, ref)
-        rails= supply_pins(pin_name_map, ref)
-        if outs:
-            out_nets = {net_of(node2net, ref, p) for p in outs}
-            if target_net in out_nets and rails:
-                for rp in rails:
-                    nr = net_of(node2net, ref, rp)
-                    vr = voltage_from_netname(nr)
-                    if vr is not None and vr >= hazard_v:
-                        return "UNSAFE", f"Output short to rail {nr} ({vr:.2f}V) at {target_net}"
-            if target_net in out_nets:
-                return "NEEDS_REVIEW", "OpAmp output at target; generic short -> review"
-        return "SAFE", "No output-to-high-rail bridge"
-
-    if "connector" in ctype:
-        pins = list(comp_pins_map[ref])
-        tgt_pins = [p for p in pins if net_of(node2net, ref, p) == target_net]
-        if tgt_pins:
-            for p in pins:
-                n = net_of(node2net, ref, p)
-                v = voltage_from_netname(n)
-                if n != target_net and v is not None and v >= hazard_v:
-                    return "UNSAFE", f"Connector pin short from {n} ({v:.2f}V) to {target_net}"
-        return "NEEDS_REVIEW", "Connector short unclear; review harness"
-
-    if comp_is_two_terminal(comp_pins_map, ref):
-        pins = list(comp_pins_map[ref])
-        n0, n1 = net_of(node2net, ref, pins[0]), net_of(node2net, ref, pins[1])
-        if n0 == target_net or n1 == target_net:
-            other = n1 if n0 == target_net else n0
-            v_other = voltage_from_netname(other)
-            if v_other is not None and v_other >= hazard_v:
-                return "UNSAFE", f"Short connects {other} ({v_other:.2f}V) to {target_net}"
-            return "SAFE", f"No high supply on opposite net ({other})"
-        return "NEEDS_REVIEW", "Two-terminal short not on target"
-
-    # Conservative multipin fallback
-    part_pins = comp_pins_map.get(ref, set())
-    part_nets = {net_of(node2net, ref, p) for p in part_pins}
-    touches_tgt = target_net in part_nets
-    touches_hi  = any((voltage_from_netname(n) or -1) >= hazard_v for n in part_nets if n)
-    if touches_tgt and touches_hi:
-        return "UNSAFE", "Multi-pin short may connect high rail to target (conservative)"
-    if touches_hi:
-        return "NEEDS_REVIEW", "Touches high rail but not target; path unclear"
-    return "SAFE", "No high rail on part nets"
-
-# ============================ LLM propagation (optional) ============================
-def label_llm(row, safety_goal: str, target_net: str,
-              nets, comp_pins_map, pin_name_map, node2net, hazard_v: float):
+# ============================ LLM classification only ============================
+def label_llm(row: pd.Series, safety_goal_text: str, target_net: str,
+              nets, comp_pins_map, pin_name_map, node2net):
+    """
+    Returns (label, reason).
+    Uses the *exact* safety_goal_text from the UI as the goal definition.
+    """
     if OAI is None:
-        return "NEEDS_REVIEW", "LLM not configured"
+        return "NEEDS_REVIEW", "LLM not configured (set OPENAI_API_KEY in secrets)."
+
     ref = str(row["RefDes"])
     pins = sorted(list(comp_pins_map.get(ref, [])))
     pinctx = []
@@ -547,81 +342,80 @@ def label_llm(row, safety_goal: str, target_net: str,
         net = node2net.get((ref, p))
         info = pin_name_map.get((ref, p), {})
         pinctx.append({"pin": p, "name": info.get("name",""), "net": net})
+
+    # Small supply hints from net names (non-binding; goal text is authoritative)
+    def guess_v(name: str):
+        if not name: return None
+        n = name.lower()
+        if n in {"/b-","/gnd","gnd","ground","0v"}: return 0.0
+        if "12v" in n or n in {"/b+"}: return 12.0
+        m = re.search(r'(\d+(?:\.\d+)?)v', n)
+        try: return float(m.group(1)) if m else None
+        except: return None
+
     supply_candidates = []
     for n in {x["net"] for x in pinctx if x.get("net")}:
-        v = voltage_from_netname(n)
-        if v is not None and v >= hazard_v:
-            supply_candidates.append({"net": n, "voltage": v})
+        v = guess_v(n)
+        if v is not None:
+            supply_candidates.append({"net": n, "voltage_hint": v})
 
     prompt = f"""
-You are an FMEDA safety expert performing single-fault propagation for an OVERVOLTAGE goal.
+You are an FMEDA safety expert. Perform single-fault propagation for the EXACT goal given below.
+Do not reinterpret or restate the goal: use it verbatim.
 
-Safety Goal: {safety_goal}
-Target net: {target_net}
-Hazard threshold (V): {hazard_v}
+SAFETY_GOAL (verbatim): {safety_goal_text}
+TARGET_NET: {target_net}
 
-Component:
+Component under analysis:
   RefDes: {ref}
   Type: {row.get('ComponentType')}
   Failure Mode: {row.get('FailureMode')}
 
-Pins (from KiCad .net):
+Pins from KiCad netlist (net names and optional pin names):
 {json.dumps(pinctx, ensure_ascii=False)}
 
-Candidate high rails (parsed from net names):
+Voltage hints inferred from net names (optional, may be incomplete):
 {json.dumps(supply_candidates, ensure_ascii=False)}
 
-Task: Decide whether THIS SINGLE FAILURE MODE can violate the goal
-(i.e., cause target net to exceed threshold), using conservative hardware reasoning.
-Return strict JSON only:
-  {{"label":"SAFE|UNSAFE|NEEDS_REVIEW","reason":"short explanation"}}
+Task:
+Decide if THIS SINGLE FAILURE MODE can violate the given safety goal.
+Be conservative when unsure.
+
+Return STRICT JSON only:
+{{
+  "label":"SAFE|UNSAFE|NEEDS_REVIEW",
+  "reason":"short, clear justification (<= 140 chars)"
+}}
 """
+
     try:
-        r = OAI.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            temperature=0
-        )
-        data = json.loads(r.choices[0].message.content)
+        # Ask for JSON output; fall back robustly if API doesn't support response_format.
+        try:
+            r = OAI.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role":"user","content":prompt}],
+                temperature=0,
+                response_format={"type":"json_object"}
+            )
+            content = r.choices[0].message.content
+        except Exception:
+            r = OAI.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role":"user","content":prompt}],
+                temperature=0
+            )
+            content = r.choices[0].message.content
+
+        data = json.loads(content)
         lab = str(data.get("label","NEEDS_REVIEW")).upper()
-        rsn = data.get("reason","")
+        rsn = str(data.get("reason",""))
         if lab not in {"SAFE","UNSAFE","NEEDS_REVIEW"}:
-            lab = "NEEDS_REVIEW"
+            lab, rsn = "NEEDS_REVIEW", f"Invalid label from LLM: {lab}"
         return lab, rsn
     except Exception as e:
         return "NEEDS_REVIEW", f"LLM error: {e}"
 
-# ============================ FMEDA expansion (NET-only) ============================
-def build_component_table_from_net(comp_pins_map: dict, ref_types: dict) -> pd.DataFrame:
-    rows = []
-    def ref_sort_key(r: str):
-        m = re.search(r'(\d+)$', r)
-        return (re.sub(r'\d+$', '', r), int(m.group(1)) if m else 0)
-    for ref in sorted(comp_pins_map.keys(), key=ref_sort_key):
-        rows.append({"RefDes": ref, "ComponentType": ref_types.get(ref, infer_type_from_ref_or_value(ref, ""))})
-    df = pd.DataFrame(rows, columns=["RefDes","ComponentType"])
-    df["ct_norm"] = df["ComponentType"].map(_norm)
-    return df
 
-def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.DataFrame:
-    if "ct_norm" not in components_df.columns:
-        components_df["ct_norm"] = components_df["ComponentType"].map(_norm)
-    if "ct_norm" not in failure_df.columns:
-        failure_df["ct_norm"] = failure_df["ComponentType"].map(_norm)
-    merged = components_df.merge(failure_df, how="left", on="ct_norm", suffixes=("_comp","_db"))
-    out = pd.DataFrame({
-        "RefDes":        merged["RefDes"],
-        "ComponentType": merged["ComponentType_comp"],
-        "FailureMode":   merged["FailureMode"],
-        "Share":         merged["Share"],
-        "FIT":           merged["FIT"],
-        "DC":            merged["DC"],
-        "Detectable":    merged["Detectable"],
-        "DiagnosticName":merged["DiagnosticName"]
-    })
-    return out.sort_values(["RefDes","ComponentType"], kind="stable").reset_index(drop=True)
-
-# ============================ Metrics ============================
 def compute_spfm(fmeda: pd.DataFrame, label_col: str) -> float | None:
     d = fmeda.copy()
     d["FIT"]   = pd.to_numeric(d["FIT"], errors="coerce")
@@ -635,19 +429,18 @@ def compute_spfm(fmeda: pd.DataFrame, label_col: str) -> float | None:
     if lam_total <= 0: return None
     return 1.0 - (lam_spf / lam_total)
 
-# ============================ UI ============================
-st.title("FMEDA — KiCad .net (S-expression/XML) • Rules vs LLM")
 
-safety_goal = st.text_input("Safety goal", "Prevent unintended output > 5 V at OUT")
-threshold_v = extract_threshold_from_goal(safety_goal, default=5.0)
+# ============================ UI ============================
+st.title("FMEDA — KiCad .net • LLM-only propagation")
+
+safety_goal = st.text_input("Safety Goal (verbatim, used as-is by the LLM)",
+                            "Prevent unintended >5 V at OUT")
 
 c0, c1 = st.columns([1,1])
 with c0:
     net_file = st.file_uploader("Upload KiCad netlist (.net — S-expression or XML)", type=["net","xml"])
 with c1:
     fail_file = st.file_uploader("Upload Failure Rates & Modes (CSV)", type=["csv"])
-
-use_llm = st.toggle("Run LLM comparison (optional)", value=False, help="Needs OPENAI_API_KEY in Streamlit secrets.")
 
 if net_file:
     try:
@@ -657,13 +450,12 @@ if net_file:
         st.stop()
 
     if not comp_pins_map:
-        st.error("Parsed 0 components from the .net. Confirm this is a KiCad netlist (not SPICE) and try again.")
+        st.error("Parsed 0 components from the .net. Confirm this is a KiCad netlist (not SPICE).")
         st.stop()
 
     node2net = invert_node_to_net(nets)
     st.success(f"Parsed NET: {len(nets)} nets • {len(comp_pins_map)} components • {len(pin_name_map)} pin-name entries.")
 
-    # Build components strictly from NET (no SCH)
     comp_df = build_component_table_from_net(comp_pins_map, ref_types)
     st.subheader("NET components (edit types if needed)")
     comp_df = st.data_editor(
@@ -673,7 +465,7 @@ if net_file:
     )
     comp_df["ct_norm"] = comp_df["ComponentType"].map(_norm)
 
-    # Target net dropdown
+    # Target net selection
     net_names = sorted(nets.keys(), key=lambda x: x.lower())
     default_idx = 0
     for i, n in enumerate(net_names):
@@ -684,11 +476,28 @@ if net_file:
     if fail_file:
         st.subheader("Failure DB preview & mapping")
         failure_df, raw_df_debug, col_share_name, col_fit_name = parse_failure_csv_with_mapping(fail_file)
-        debug_numeric_preview(raw_df_debug, col_share_name, col_fit_name)
-        st.divider()
 
-        if st.button("Build FMEDA (NET-only)"):
-            fmeda = expand_fmeda(comp_df, failure_df)
+        # quick parse debug
+        rs = raw_df_debug[col_share_name].astype(str)
+        rf = raw_df_debug[col_fit_name].astype(str)
+        preview = pd.DataFrame({
+            "Share_raw": rs.head(8).tolist(),
+            "FIT_raw":   rf.head(8).tolist(),
+        })
+        st.write("Parsing preview (first few rows):")
+        st.dataframe(preview, height=180)
+
+        st.divider()
+        run = st.button("Build FMEDA with LLM")
+        if run:
+            if OAI is None:
+                st.error("LLM not configured. Set OPENAI_API_KEY in Streamlit secrets.")
+                st.stop()
+
+            # Expand FMEDA
+            fmeda = comp_df.merge(failure_df, how="left", on="ct_norm", suffixes=("_comp","_db"))
+            fmeda = fmeda[["RefDes","ComponentType_comp","FailureMode","Share","FIT","DC","Detectable","DiagnosticName"]] \
+                         .rename(columns={"ComponentType_comp":"ComponentType"})
 
             # Fill missing Share equally per (RefDes, ComponentType)
             fmeda["Share"] = pd.to_numeric(fmeda["Share"], errors="coerce")
@@ -701,85 +510,58 @@ if net_file:
                 )
                 fmeda.loc[mask_na, "Share"] = eq
 
-            # DC defaults 0
             fmeda["DC"] = pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0).clip(0,1)
-
-            # Deterministic labels
-            labels_rules, reasons_rules = [], []
-            for _, row in fmeda.iterrows():
-                if pd.isna(row["FIT"]) or pd.isna(row["Share"]):
-                    labels_rules.append("UNASSESSED"); reasons_rules.append("Missing FIT/Share or unknown type")
-                    continue
-                lab, rsn = label_rules(row, nets, comp_pins_map, pin_name_map, node2net, target_net, threshold_v)
-                labels_rules.append(lab); reasons_rules.append(rsn)
-            fmeda["Label_rules"]  = labels_rules
-            fmeda["Reason_rules"] = reasons_rules
-
-            # LLM labels (optional)
-            if use_llm:
-                labels_llm, reasons_llm = [], []
-                for _, row in fmeda.iterrows():
-                    if pd.isna(row["FIT"]) or pd.isna(row["Share"]):
-                        labels_llm.append("UNASSESSED"); reasons_llm.append("Missing FIT/Share or unknown type")
-                        continue
-                    lab, rsn = label_llm(row, safety_goal, target_net, nets, comp_pins_map, pin_name_map, node2net, threshold_v)
-                    labels_llm.append(lab); reasons_llm.append(rsn)
-                fmeda["Label_llm"]  = labels_llm
-                fmeda["Reason_llm"] = reasons_llm
-                fmeda["Label_diff"] = (fmeda["Label_rules"].astype(str).str.upper()
-                                       != fmeda["Label_llm"].astype(str).str.upper())
-            else:
-                fmeda["Label_llm"] = ""
-                fmeda["Reason_llm"] = ""
-                fmeda["Label_diff"] = False
-
-            # Effective FIT & SPFM
             fmeda["FIT_eff"] = (
-                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(pd.NA)
-                * pd.to_numeric(fmeda["Share"], errors="coerce").fillna(pd.NA)
-                * (1.0 - pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0))
+                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(0.0)
+                * fmeda["Share"].astype(float)
+                * (1.0 - fmeda["DC"].astype(float))
             )
 
-            spfm_rules = compute_spfm(fmeda, label_col="Label_rules")
-            if spfm_rules is not None:
-                st.metric("SPFM (Rules)", f"{spfm_rules*100:.2f}%")
+            # LLM pass
+            labels, reasons = [], []
+            prog = st.progress(0.0, text="Classifying with LLM…")
+            total = len(fmeda)
+            for idx, (_, row) in enumerate(fmeda.iterrows(), start=1):
+                lab, rsn = label_llm(row, safety_goal, target_net, nets, comp_pins_map, pin_name_map, node2net)
+                labels.append(lab); reasons.append(rsn)
+                prog.progress(idx/total, text=f"Classifying with LLM… {idx}/{total}")
+                # tiny sleep to avoid rate spikes; adjust as needed
+                sleep(0.02)
+            fmeda["Label_llm"]  = labels
+            fmeda["Reason_llm"] = reasons
+
+            spfm_llm = compute_spfm(fmeda, label_col="Label_llm")
+            if spfm_llm is not None:
+                st.metric("SPFM (LLM)", f"{spfm_llm*100:.2f}%")
             else:
-                st.info("SPFM (Rules) not computable (no valid FIT×Share).")
+                st.info("SPFM (LLM) not computable (no valid FIT×Share).")
 
-            if use_llm:
-                spfm_llm = compute_spfm(fmeda, label_col="Label_llm")
-                if spfm_llm is not None:
-                    st.metric("SPFM (LLM)", f"{spfm_llm*100:.2f}%")
-                else:
-                    st.info("SPFM (LLM) not computable (no valid FIT×Share).")
-
-            st.subheader("FMEDA — NET-only • Rules vs LLM")
+            st.subheader("FMEDA — LLM result")
             st.dataframe(
                 fmeda[[
                     "RefDes","ComponentType","FailureMode","Share","FIT","DC",
-                    "Label_rules","Reason_rules","Label_llm","Reason_llm","Label_diff","FIT_eff"
+                    "Label_llm","Reason_llm","FIT_eff"
                 ]],
                 height=560, use_container_width=True
             )
 
-            st.download_button("Download FMEDA (CSV)",
-                               fmeda.to_csv(index=False).encode("utf-8"),
-                               "fmeda_results.csv","text/csv")
+            # Downloads
+            csv_bytes = fmeda.to_csv(index=False).encode("utf-8")
+            st.download_button("Download FMEDA (CSV)", csv_bytes, "fmeda_llm_only.csv","text/csv")
 
             if EXCEL_ENABLED:
                 xbuf = io.BytesIO()
                 with pd.ExcelWriter(xbuf, engine="xlsxwriter") as xw:
                     fmeda.to_excel(xw, index=False, sheet_name="FMEDA")
                     meta = {
-                        "SafetyGoal": safety_goal,
-                        "Threshold_V": threshold_v,
+                        "SafetyGoal_verbatim": safety_goal,
                         "TargetNet": target_net,
-                        "LLM_Enabled": use_llm
+                        "Model": OPENAI_MODEL,
                     }
                     pd.DataFrame([meta]).to_excel(xw, index=False, sheet_name="Summary")
                 st.download_button("Download FMEDA (XLSX)",
                                    xbuf.getvalue(),
-                                   "fmeda_results.xlsx",
+                                   "fmeda_llm_only.xlsx",
                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
                 st.info("Excel export disabled (install `xlsxwriter`).")

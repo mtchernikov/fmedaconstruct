@@ -1,36 +1,56 @@
 import streamlit as st
 import pandas as pd
-import re, io, csv, json
+import re, io, csv, json, math
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 
-# ---------------------------- App config ----------------------------
-st.set_page_config(page_title="FMEDA Builder (KiCad + Failure DB)", layout="wide")
-OPENAI_MODEL = "gpt-4o"  # optional; only used when toggled
+# ============================ App config ============================
+st.set_page_config(page_title="FMEDA Builder (KiCad sch+net)", layout="wide")
+OPENAI_MODEL = "gpt-4o"  # optional only if toggled
 
-# Optional OpenAI client (needs st.secrets["OPENAI_API_KEY"])
+# Optional OpenAI client (keine Pflicht)
 try:
     from openai import OpenAI
     OAI = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
 except Exception:
     OAI = None
 
-# Optional Excel export dependency
+# Optional Excel Export
 try:
     import xlsxwriter  # noqa: F401
     EXCEL_ENABLED = True
 except Exception:
     EXCEL_ENABLED = False
 
-# ---------------------------- helpers ----------------------------
+# ============================ Helpers ============================
+_num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
 
-# ============================ KiCad 9 schematic parser ============================
+def parse_number_series(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    v = s.astype(str).replace({"None":"", "none":"", "nan":""})
+    v = v.str.extract(_num_pat, expand=True)[0]
+    v = v.str.replace(",", ".", regex=False)
+    return pd.to_numeric(v, errors="coerce")
+
+def parse_share_series(s: pd.Series) -> pd.Series:
+    raw  = s.astype(str).replace({"None":"", "none":"", "nan":""})
+    nums = parse_number_series(raw)
+    is_pct = raw.str.contains("%")
+    nums = nums.where(~is_pct, nums / 100.0)
+    maxv = pd.to_numeric(nums, errors="coerce").max(skipna=True)
+    if pd.notna(maxv) and maxv > 1.5:
+        nums = nums / 100.0
+    return nums
+
+# ============================ KiCad sch parser (S-Expression) ============================
 REF_PREFIX = {
     "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
     "Q":"MOSFET","T":"BJT","U":"IC_Analog","A":"OpAmp","K":"Relay","F":"Fuse",
     "J":"Connector","X":"Connector",
 }
-
 def detect_type_from_ref(ref: str):
     m = re.match(r'^([A-Za-z]+)', ref or "")
     if not m: return None
@@ -45,7 +65,7 @@ def detect_type_from_lib(lib_id: str):
     if ":cp" in s or "electroly" in s: return "Capacitor_Polarized"
     if ":c" in s or "capacitor" in s: return "Capacitor"
     if ":r" in s or "resistor" in s: return "Resistor"
-    if "lm393" in s or "comparator" in s: return "Comparator"
+    if "comparator" in s: return "Comparator"
     if "mos" in s or "nmos" in s or "pmos" in s or "irf" in s: return "MOSFET"
     if "diode" in s: return "Diode"
     if "relay" in s: return "Relay"
@@ -56,14 +76,13 @@ def detect_type_from_value(val: str):
     t = (val or "").lower()
     if re.search(r'(^|\s)\d+(\.\d+)?(r|k|m)?(\s*ohm|$)', t): return "Resistor"
     if re.search(r'(^|\s)\d+(\.\d+)?(n|u|µ|p|f)(\s*|$)', t): return "Capacitor"
-    if "ne5532" in t or "lm358" in t: return "OpAmp"
+    if any(x in t for x in ["lm358","ne5532","tl072"]): return "OpAmp"
     if "irf" in t or "irfp" in t: return "MOSFET"
     return None
 
 def _iter_blocks(text: str, tag: str):
     needle = f"({tag}"
-    i = text.find(needle)
-    n = len(text)
+    i = text.find(needle); n = len(text)
     while i != -1:
         depth = 0; start = i; j = i
         while j < n:
@@ -85,17 +104,14 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
         lib_id = m_lib.group(1) if m_lib else ""
         ref = (m_ref.group(1) if m_ref else "").strip()
         val = (m_val.group(1) if m_val else "").strip()
-
         t  = detect_type_from_ref(ref)
         t2 = detect_type_from_lib(lib_id) or detect_type_from_value(val)
         if t == "IC_Analog" and t2: t = t2
         elif t2 and t != t2:
             if t in ("IC_Analog","Other") or (t == "Capacitor" and t2 == "Capacitor_Polarized"): t = t2
-
         ctype = t or "Other"
         if not ref: ref = "?"
         rows.append({"RefDes": ref, "ComponentType": ctype})
-
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["RefDes","ComponentType","ct_norm"])
@@ -103,49 +119,46 @@ def parse_kicad_sch_components(sch_text: str) -> pd.DataFrame:
     df["ct_norm"] = df["ComponentType"].map(_norm)
     return df[["RefDes","ComponentType","ct_norm"]]
 
-# ============================ Failure DB parsing ============================
-_num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
+# ============================ KiCad netlist parser (.net XML) ============================
+def parse_kicad_net(xml_bytes: bytes):
+    """
+    Returns:
+      nets: dict[str, set[(ref,pin)]]
+      comp_pins: dict[ref] -> set[pin_numbers_as_str]
+    """
+    nets = defaultdict(set)
+    comp_pins = defaultdict(set)
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return {}, {}
+    # typical structure: /export/netlist/nets/net (name/code) -> node ref/pin
+    # and components under /export/components/comp
+    for net in root.findall(".//net"):
+        name = net.get("name") or ""
+        for node in net.findall(".//node"):
+            ref = node.get("ref") or ""
+            pin = node.get("pin") or ""
+            if ref and pin:
+                nets[name].add((ref, pin))
+                comp_pins[ref].add(pin)
+    return dict(nets), {k: set(v) for k, v in comp_pins.items()}
 
-def parse_number_series(s: pd.Series) -> pd.Series:
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_numeric(s, errors="coerce")
-    v = s.astype(str).replace({"None":"", "none":"", "nan":""})
-    v = v.str.extract(_num_pat, expand=True)[0]
-    v = v.str.replace(",", ".", regex=False)
-    return pd.to_numeric(v, errors="coerce")
-
-def parse_share_series(s: pd.Series) -> pd.Series:
-    raw  = s.astype(str).replace({"None":"", "none":"", "nan":""})
-    nums = parse_number_series(raw)
-    is_pct = raw.str.contains("%")
-    nums = nums.where(~is_pct, nums / 100.0)
-    maxv = pd.to_numeric(nums, errors="coerce").max(skipna=True)
-    if pd.notna(maxv) and maxv > 1.5:
-        nums = nums / 100.0
-    return nums
-
+# ============================ Failure DB parsing & mapping ============================
 def auto_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Auto-map Probability/Share and FIT variants to canonical names."""
     ren = {}
     have_share = any(_norm(c) == "share" for c in df.columns)
     have_fit   = any(_norm(c) == "fit"   for c in df.columns)
-
     for c in df.columns:
-        n = _norm(c)  # e.g. "probability(%)" -> "probability"
-        if not have_share:
-            if ("probabil" in n) or (n in {"probability","probabilitypct","probabilitypercent"}) or ("share" in n):
-                ren[c] = "Share"
-                have_share = True
-        if not have_fit:
-            if n in {"fit","basefit","fitbasefit","lambdafit","lambda","failurerate","rate"}:
-                ren[c] = "FIT"
-                have_fit = True
+        n = _norm(c)
+        if not have_share and (("probabil" in n) or (n in {"probability","probabilitypct","probabilitypercent"}) or ("share" in n) or ("distribution" in n)):
+            ren[c] = "Share"; have_share = True
+        if not have_fit and (n in {"fit","basefit","fitbasefit","lambdafit","lambda","failurerate","rate"}):
+            ren[c] = "FIT"; have_fit = True
     return df.rename(columns=ren) if ren else df
 
 def parse_failure_csv_with_mapping(upload):
-    """Return: (normalized_table, raw_dataframe, share_col_name, fit_col_name)"""
     raw_bytes = upload.read(); upload.seek(0)
-
     # delimiter sniff
     sample = raw_bytes[:4096].decode("utf-8", errors="ignore")
     try:
@@ -172,28 +185,24 @@ def parse_failure_csv_with_mapping(upload):
         if tmp.shape[1] == len(cols):
             tmp.columns = cols; raw = tmp
 
-    # auto-rename common variants
     raw = auto_rename_columns(raw)
     st.write("CSV columns (auto-renamed if needed):", list(raw.columns))
 
-    # column detection (prefer exact names now that we renamed)
-    FIT_ALIASES   = ["FIT", "FIT (Base FIT)", "Base FIT"]
-    SHARE_ALIASES = ["Share", "Share (Probability)", "Probability"]
+    FIT_ALIASES   = ["FIT","FIT (Base FIT)","Base FIT"]
+    SHARE_ALIASES = ["Share","Share (Probability)","Probability"]
 
     def pick_by_alias(aliases, cols):
         for a in aliases:
-            if a in cols:
-                return a
+            if a in cols: return a
         return None
 
     norm = {c: _norm(c) for c in raw.columns}
     def find_col(cands):
         for orig, n in norm.items():
-            if n in cands:
-                return orig
+            if n in cands: return orig
         return None
 
-    c_fit   = pick_by_alias(FIT_ALIASES,   list(raw.columns)) or find_col({"fit","lambda","rate"})
+    c_fit   = pick_by_alias(FIT_ALIASES, list(raw.columns)) or find_col({"fit","lambda","rate"})
     c_share = pick_by_alias(SHARE_ALIASES, list(raw.columns)) or find_col({"share","percent","distribution"})
     c_type  = find_col({"componenttype","type","class","category","parttype","compclass"})
     c_mode  = find_col({"failuremode","mode","fm"})
@@ -216,7 +225,6 @@ def parse_failure_csv_with_mapping(upload):
         c_det=None if c_det=="<none>" else c_det
         c_dnm=None if not c_dnm else c_dnm
 
-    # canonicalize ComponentType like "Resistor;Passive;Fixed …"
     def canon_type_cell(s: str) -> str:
         parts = [p.strip() for p in str(s).split(";") if p.strip()]
         if not parts: return ""
@@ -243,20 +251,15 @@ def parse_failure_csv_with_mapping(upload):
 
     st.success("Failure DB parsed.")
     st.dataframe(out.head(20), height=240)
-
     return out, raw, c_share, c_fit
 
-# --------------------------- Debug helper ---------------------------
 def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n: int = 12):
     rs = raw_df[col_share].astype(str)
     rf = raw_df[col_fit].astype(str)
     ps = parse_share_series(rs)
     pf = parse_number_series(rf)
-
-    mask = rs.replace({"None":"", "nan":""}).str.strip().ne("") | \
-           rf.replace({"None":"", "nan":""}).str.strip().ne("")
+    mask = rs.replace({"None":"", "nan":""}).str.strip().ne("") | rf.replace({"None":"", "nan":""}).str.strip().ne("")
     idx = raw_df.index[mask][:n]
-
     dbg = pd.DataFrame({
         "Share_raw":  rs.loc[idx].values,
         "Share_parsed": ps.loc[idx].values,
@@ -266,16 +269,14 @@ def debug_numeric_preview(raw_df: pd.DataFrame, col_share: str, col_fit: str, n:
     st.write("🔎 Parsing samples (first non-empty rows):")
     st.dataframe(dbg, height=240)
 
-# ============================ FMEDA expand (keeps RefDes first) ============================
+# ============================ FMEDA expand (joins sch with DB) ============================
 def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.DataFrame:
     if "ct_norm" not in components_df.columns:
         components_df["ct_norm"] = components_df["ComponentType"].map(_norm)
     if "ct_norm" not in failure_df.columns:
         failure_df["ct_norm"] = failure_df["ComponentType"].map(_norm)
-
     merged = components_df.merge(failure_df, how="left", on="ct_norm", suffixes=("_sch","_db"))
     unknown = merged["ComponentType_db"].isna() | (merged["ComponentType_sch"].str.lower()=="unknown component")
-
     out = pd.DataFrame({
         "RefDes":        merged["RefDes"],
         "ComponentType": merged["ComponentType_sch"].mask(unknown, "unknown component"),
@@ -288,7 +289,150 @@ def expand_fmeda(components_df: pd.DataFrame, failure_df: pd.DataFrame) -> pd.Da
     })
     return out.sort_values(["RefDes","ComponentType"], kind="stable").reset_index(drop=True)
 
-# ============================ Optional LLM ============================
+# ============================ Supply / Target parsing ============================
+SUPPLY_DEFAULTS = {
+    "vcc": 5.0, "vdd": 5.0, "vin": 12.0, "vbatt": 12.0, "vbat": 12.0,
+    "+5v": 5.0, "5v": 5.0, "3v3": 3.3, "3.3v": 3.3, "+3v3": 3.3, "+12v": 12.0, "12v": 12.0,
+    "avcc": 5.0, "dvcc": 5.0
+}
+def voltage_from_netname(name: str) -> float | None:
+    if not name: return None
+    n = _norm(name)
+    if n in SUPPLY_DEFAULTS: return SUPPLY_DEFAULTS[n]
+    m = re.search(r'(\d+(?:\.\d+)?)v', n)  # e.g. 5v, 3v3 -> first "3"
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            pass
+    # 3v3 common: try "3v3"
+    m2 = re.search(r'(\d)v(\d)', n)
+    if m2:
+        return float(f"{m2.group(1)}.{m2.group(2)}")
+    return None
+
+def extract_threshold_from_goal(text: str, default: float = 5.0) -> float:
+    if not text: return default
+    m = re.search(r'(\d+(?:\.\d+)?)\s*v', text.lower())
+    return float(m.group(1)) if m else default
+
+# ============================ Propagation Engine (single-fault) ============================
+def nets_touch_component(nets: dict[str,set[tuple]], ref: str):
+    """Return set of net names that have at least one node for given ref."""
+    out = set()
+    for n, nodes in nets.items():
+        for (r,_p) in nodes:
+            if r == ref:
+                out.add(n); break
+    return out
+
+def component_is_two_terminal(net_pins: set[str]) -> bool:
+    return len(net_pins) == 2
+
+def failure_creates_short(failure_mode: str) -> bool:
+    if not isinstance(failure_mode, str): return False
+    fm = failure_mode.lower()
+    return any(k in fm for k in ["short", "s/c", "sc"])
+
+def failure_is_open(failure_mode: str) -> bool:
+    if not isinstance(failure_mode, str): return False
+    fm = failure_mode.lower()
+    return any(k in fm for k in ["open", "o/c", "oc"])
+
+def failure_short_to_named(failure_mode: str) -> str | None:
+    """Detect 'short to VCC/GND/...' pattern."""
+    if not isinstance(failure_mode, str): return None
+    fm = failure_mode.lower()
+    m = re.search(r'short\s*(to|2)\s*([a-z0-9\+\-\.]+)', fm)
+    if m:
+        return m.group(2)
+    return None
+
+def label_violation_for_row(row, nets: dict[str,set[tuple]], comp_pins_map: dict[str,set[str]],
+                            target_net: str, hazard_threshold_v: float):
+    """
+    Conservative single-fault rule:
+      - Only shorts can inject high potential directly.
+      - We check if the component connects from any 'supply-like' net with voltage >= threshold
+        onto the target net by its short failure.
+      - Opens are SAFE for an overvoltage-goal.
+      - Unknown multi-pin shorts are NEEDS_REVIEW if they touch both a high-supply net and target net.
+    """
+    ref = str(row["RefDes"])
+    fm  = str(row.get("FailureMode","") or "")
+    ctype = str(row.get("ComponentType","") or "")
+    if ref not in comp_pins_map:
+        return "UNASSESSED", "No pin/nets info in .net"
+
+    # Target net present?
+    if target_net not in nets:
+        return "UNASSESSED", f"Target net '{target_net}' not found"
+
+    # Which nets this component touches?
+    nets_of_comp = nets_touch_component(nets, ref)
+    if not nets_of_comp:
+        return "UNASSESSED", "Component not placed in any net"
+
+    # classify failure
+    if failure_is_open(fm):
+        return "SAFE", "Open fault cannot raise voltage at target in this simplified model"
+
+    if not failure_creates_short(fm):
+        # leakage, drift, param shift -> not modeled -> needs review
+        return "NEEDS_REVIEW", "Non-short failure not modeled for overvoltage; manual assessment"
+
+    # Named short target? e.g. "short to VCC"
+    named = failure_short_to_named(fm)
+    # Identify supply-like nets among component nets
+    supply_candidates = []
+    for n in nets_of_comp:
+        v = voltage_from_netname(n)
+        if v is not None and v >= hazard_threshold_v - 1e-9:
+            supply_candidates.append((n, v))
+
+    # If explicit 'short to <NAME>' and that name resolves to a supply >= threshold:
+    if named:
+        # try to resolve alias directly or via voltage parsing
+        named_v = voltage_from_netname(named)
+        if named_v is None:
+            # if 'gnd' -> 0 V
+            if _norm(named) in {"gnd","ground","0v"}:
+                named_v = 0.0
+        if named_v is not None and named_v >= hazard_threshold_v - 1e-9:
+            # Does the component also touch the target net?
+            if target_net in nets_of_comp:
+                return "UNSAFE", f"'{fm}' injects {named_v:.2f}V to target via {ref}"
+            # Or: explicit short between the target net name string and named supply exists?
+        # fall through to generic
+
+    # Generic short: If the component is two-terminal and one side is supply>=threshold and the other side is target, hazard.
+    if component_is_two_terminal(comp_pins_map[ref]):
+        # two nets only
+        comp_nets = list(nets_of_comp)
+        if len(comp_nets) == 2:
+            a, b = comp_nets
+            # if either side is target and the other a high supply
+            if target_net in (a, b):
+                other = b if target_net == a else a
+                v_other = voltage_from_netname(other)
+                if v_other is not None and v_other >= hazard_threshold_v - 1e-9:
+                    return "UNSAFE", f"Short connects {other} (≈{v_other:.2f}V) to {target_net}"
+                else:
+                    return "SAFE", f"No high supply on opposite net ({other})"
+        # more than 2 nets in .net (unusual for two-terminal) -> conservative review
+        return "NEEDS_REVIEW", "Two-terminal part touches >2 nets in .net; review"
+
+    # Multi-pin parts (ICs, MOSFETs etc.): conservative rule
+    touches_target = target_net in nets_of_comp
+    touches_high = len(supply_candidates) > 0
+    if touches_target and touches_high:
+        vs = ", ".join(f"{n}({v:.1f}V)" for n,v in supply_candidates[:3])
+        return "UNSAFE", f"Short in multi-pin {ctype} may connect {vs} to {target_net}"
+    if touches_high:
+        return "NEEDS_REVIEW", f"Short could bridge high supply {supply_candidates[0][0]} to neighbor nets; target not directly on this part"
+    return "SAFE", "No high supply among nets of this component"
+
+# ============================ LLM (optional) ============================
 def llm_classify_row(row: pd.Series, safety_goal: str):
     if OAI is None:
         return "NEEDS_REVIEW", "No OpenAI key configured."
@@ -311,31 +455,45 @@ Return JSON only: {{"label":"SAFE|UNSAFE|NEEDS_REVIEW","reason":"<short>"}}"""
     except Exception as e:
         return "NEEDS_REVIEW", f"LLM error: {e}"
 
-def compute_spfm(fmeda: pd.DataFrame) -> float:
+# ============================ Metrics ============================
+def compute_spfm(fmeda: pd.DataFrame) -> float | None:
     d = fmeda.copy()
-    if "FIT_eff" not in d.columns:
-        d["FIT_eff"] = pd.to_numeric(d["FIT"], errors="coerce").fillna(0.0)
-    lam_total = d["FIT_eff"].sum()
-    lam_spf   = d.loc[d.get("Label","SAFE").str.upper()=="UNSAFE", "FIT_eff"].sum()
-    return 1.0 if lam_total == 0 else 1.0 - lam_spf/lam_total
+    # nur gültige Zahlen
+    d["FIT"]   = pd.to_numeric(d["FIT"], errors="coerce")
+    d["Share"] = pd.to_numeric(d["Share"], errors="coerce")
+    d["DC"]    = pd.to_numeric(d["DC"], errors="coerce").fillna(0.0).clip(0,1)
+    # Effektiver Beitrag pro FM
+    d["FIT_eff"] = (d["FIT"] * d["Share"] * (1.0 - d["DC"]))
+    # Ungültige (NaN) ignorieren
+    valid = d["FIT_eff"].notna()
+    if not valid.any():
+        return None
+    lam_total = d.loc[valid, "FIT_eff"].sum()
+    lam_spf   = d.loc[valid & (d.get("Label","SAFE").str.upper()=="UNSAFE"), "FIT_eff"].sum()
+    if lam_total <= 0:
+        return None
+    return 1.0 - (lam_spf / lam_total)
 
-# ==================================== UI ====================================
-st.title("FMEDA Builder — KiCad schematic × Failure DB")
+# ============================ UI ============================
+st.title("FMEDA Builder — KiCad sch + net × Failure DB")
 
-safety_goal = st.text_input("Safety goal", "Prevent unintended output > 5 V")
-use_llm     = st.toggle("Use LLM for SAFE/UNSAFE classification", value=False, help="Needs OPENAI_APIKEY in secrets")
+safety_goal = st.text_input("Safety goal (free text)", "Prevent unintended output > 5 V at OUT")
+target_net  = st.text_input("Target net name (exact as in netlist)", "OUT")
+use_llm     = st.toggle("Use LLM (optional) to refine SAFE/UNSAFE", value=False)
 
-left, right = st.columns([1,1])
+left, mid, right = st.columns([1,1,1])
 with left:
     sch_file = st.file_uploader("Upload KiCad 9 schematic (.kicad_sch)", type=["kicad_sch"])
+with mid:
+    net_file = st.file_uploader("Upload KiCad netlist (.net XML)", type=["net","xml"])
 with right:
-    fail_file = st.file_uploader("Upload Failure Rates & Modes CSV", type=["csv"])
+    fail_file = st.file_uploader("Upload Failure Rates & Modes (CSV)", type=["csv"])
 
 if sch_file:
     sch_text = sch_file.read().decode("utf-8", errors="ignore")
-    comp_df = parse_kicad_sch_components(sch_text)
+    comp_df  = parse_kicad_sch_components(sch_text)
 
-    st.subheader("Detected components (edit if needed)")
+    st.subheader("Detected components (editable)")
     comp_df = st.data_editor(
         comp_df[["RefDes","ComponentType","ct_norm"]].rename(columns={"ct_norm":"_norm (read-only)"}),
         disabled=["_norm (read-only)"],
@@ -343,18 +501,26 @@ if sch_file:
     )
     comp_df["ct_norm"] = comp_df["ComponentType"].map(_norm)
 
+    # Netlist parse (optional but recommended)
+    nets, comp_pins_map = ({}, {})
+    if net_file:
+        nets, comp_pins_map = parse_kicad_net(net_file.read())
+        st.success(f"Netlist parsed: {len(nets)} nets, {len(comp_pins_map)} components with pin mapping.")
+        # kleine Vorschau
+        if nets:
+            some = list(nets.items())[:5]
+            st.write({k: list(v)[:4] for k,v in some})
+
     if fail_file:
         st.subheader("Failure DB preview & mapping")
         failure_df, raw_df_debug, col_share_name, col_fit_name = parse_failure_csv_with_mapping(fail_file)
-
-        # Debug: raw vs parsed
         debug_numeric_preview(raw_df_debug, col_share_name, col_fit_name)
-
         st.divider()
+
         if st.button("Build FMEDA table"):
             fmeda = expand_fmeda(comp_df, failure_df)
 
-            # Fill missing Share inside each RefDes group (equal split)
+            # fehlende Share pro (RefDes,ComponentType) gleichmäßig verteilen
             fmeda["Share"] = pd.to_numeric(fmeda["Share"], errors="coerce")
             mask_na = fmeda["Share"].isna()
             if mask_na.any():
@@ -365,49 +531,61 @@ if sch_file:
                 )
                 fmeda.loc[mask_na, "Share"] = eq
 
-            # DC defaults to 0
+            # DC defaults 0
             fmeda["DC"] = pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0).clip(0,1)
 
-            # Effective FIT (per failure mode)
+            # einfache Propagation gegen Safety Goal
+            threshold_v = extract_threshold_from_goal(safety_goal, default=5.0)
+            labels, reasons = [], []
+            for _, row in fmeda.iterrows():
+                if pd.isna(row["FIT"]) or pd.isna(row["Share"]):
+                    labels.append("UNASSESSED"); reasons.append("Missing FIT/Share or unknown type")
+                    continue
+                if not nets or not comp_pins_map:
+                    labels.append("NEEDS_REVIEW"); reasons.append("No netlist; cannot trace propagation")
+                    continue
+                lab, rsn = label_violation_for_row(row, nets, comp_pins_map, target_net, threshold_v)
+                labels.append(lab); reasons.append(rsn)
+
+            fmeda["Label"]  = labels
+            fmeda["Reason"] = reasons
+
+            # Effektiver FIT pro FM
             fmeda["FIT_eff"] = (
-                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(0.0)
-                * fmeda["Share"].astype(float)
-                * (1.0 - fmeda["DC"].astype(float))
+                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(pd.NA)
+                * pd.to_numeric(fmeda["Share"], errors="coerce").fillna(pd.NA)
+                * (1.0 - pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0))
             )
 
-            if use_llm:
-                labels=[]; reasons=[]
-                for _, row in fmeda.iterrows():
-                    if pd.isna(row["FIT"]):
-                        labels.append("UNASSESSED"); reasons.append("Unknown type / NaN FIT")
-                    else:
-                        lab, rsn = llm_classify_row(row, safety_goal)
-                        labels.append(lab); reasons.append(rsn)
-                fmeda["Label"]=labels; fmeda["Reason"]=reasons
-                spfm = compute_spfm(fmeda)
-                st.metric("SPFM (approx.)", f"{spfm*100:.2f}%")
+            spfm = compute_spfm(fmeda)
+            if spfm is not None:
+                st.metric("SPFM (single point fault metric, approx.)", f"{spfm*100:.2f}%")
+            else:
+                st.info("SPFM nicht berechenbar (keine gültigen FIT×Share Werte).")
 
-            st.subheader("FMEDA result (RefDes first)")
-            st.dataframe(fmeda, height=420)
+            st.subheader("FMEDA result")
+            st.dataframe(fmeda, height=480, use_container_width=True)
 
-            # CSV download
+            # CSV Download
             st.download_button("Download FMEDA (CSV)",
                                fmeda.to_csv(index=False).encode("utf-8"),
                                "fmeda_results.csv","text/csv")
 
-            # Excel download (safe fallback)
+            # Excel Download
             if EXCEL_ENABLED:
                 xbuf = io.BytesIO()
                 with pd.ExcelWriter(xbuf, engine="xlsxwriter") as xw:
                     fmeda.to_excel(xw, index=False, sheet_name="FMEDA")
-                    pd.DataFrame([{"SafetyGoal":safety_goal, "LLM": use_llm}]) \
-                        .to_excel(xw, index=False, sheet_name="Summary")
+                    pd.DataFrame([{
+                        "SafetyGoal": safety_goal,
+                        "TargetNet": target_net,
+                        "LLM": use_llm
+                    }]).to_excel(xw, index=False, sheet_name="Summary")
                 st.download_button("Download FMEDA (XLSX)",
                                    xbuf.getvalue(),
                                    "fmeda_results.xlsx",
                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
-                st.info("Excel export is disabled (package `xlsxwriter` not installed). "
-                        "Install it to enable XLSX downloads: `pip install xlsxwriter`")
+                st.info("Excel-Export deaktiviert (installiere `xlsxwriter`).")
 else:
-    st.info("Upload a KiCad 9 schematic to start.")
+    st.info("Bitte .kicad_sch hochladen, dann .net und Failure-DB (CSV).")

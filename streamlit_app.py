@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
-import re, io, csv, json
+import re, io, csv, json, time
 from collections import defaultdict
-from time import sleep
 
 # ============================ App config ============================
-st.set_page_config(page_title="FMEDA (KiCad .net) — LLM only", layout="wide")
-OPENAI_MODEL = "gpt-4o"  # requires OPENAI_API_KEY in Streamlit secrets
+st.set_page_config(page_title="Safety Co-Pilot — FMEDA + Sensitivity (LLM)", layout="wide")
+OPENAI_MODEL = "gpt-4o"  # needs OPENAI_API_KEY in st.secrets
 
 # Optional OpenAI client
 try:
@@ -23,8 +22,9 @@ except Exception:
     EXCEL_ENABLED = False
 
 
-# ============================ Utils ============================
+# ============================ Utilities ============================
 _num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
+
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
 
@@ -47,9 +47,8 @@ def parse_share_series(s: pd.Series) -> pd.Series:
     return nums
 
 
-# ============================ S-expression helpers ============================
+# ============================ KiCad .net parsing (S-exp + XML) ============================
 def iter_blocks_exact(text: str, tag: str):
-    """Yield balanced s-expr blocks starting with '({tag} ' or '({tag}(' ."""
     pat = re.compile(r'\(' + re.escape(tag) + r'(?=[\s\()])')
     for m in pat.finditer(text):
         i = m.start()
@@ -66,7 +65,6 @@ def iter_blocks_exact(text: str, tag: str):
             j += 1
 
 def _token_alt(key):
-    # matches (key "X") or (key X)
     return rf'\({key}\s+("([^"]+)"|[^\s\)]+)\)'
 
 def _pick(m, quoted_idx=2, any_idx=1):
@@ -85,13 +83,12 @@ def _pick(m, quoted_idx=2, any_idx=1):
         return ""
     return val.strip('"')
 
-
-# ============================ NET parser (S-exp + XML) ============================
 REF_PREFIX = {
     "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
     "Q":"Transistor","T":"Transistor","U":"IC","A":"OpAmp","K":"Relay","F":"Fuse",
     "J":"Connector","X":"Connector",
 }
+
 def infer_type(ref: str, value: str) -> str:
     m = re.match(r'^([A-Za-z]+)', ref or "")
     base = "Other"
@@ -113,7 +110,7 @@ def infer_type(ref: str, value: str) -> str:
 def parse_kicad_net(net_bytes: bytes):
     text = net_bytes.decode("utf-8", errors="ignore").strip()
 
-    # XML path
+    # XML
     if text.startswith("<"):
         import xml.etree.ElementTree as ET
         root = ET.fromstring(text)
@@ -159,7 +156,7 @@ def parse_kicad_net(net_bytes: bytes):
 
         return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
 
-    # S-expression path
+    # S-expression
     nets = defaultdict(set)
     comp_pins = defaultdict(set)
     pin_name_map = {}
@@ -196,7 +193,6 @@ def parse_kicad_net(net_bytes: bytes):
     ref_types = {ref: infer_type(ref, ref_values.get(ref,"")) for ref in comp_pins.keys()}
     return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
 
-
 def invert_node_to_net(nets: dict[str,set[tuple]]):
     node2net = {}
     for net_name, nodes in nets.items():
@@ -212,7 +208,7 @@ def auto_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
     have_fit   = any(_norm(c) == "fit"   for c in df.columns)
     for c in df.columns:
         n = _norm(c)
-        if not have_share and (("probabil" in n) or (n in {"probability","probabilitypct","probabilitypercent"}) or ("share" in n) or ("distribution" in n)):
+        if not have_share and (("probabil" in n) or ("share" in n) or ("distribution" in n) or n.startswith("probability")):
             ren[c] = "Share"; have_share = True
         if not have_fit and (n in {"fit","basefit","fitbasefit","lambdafit","lambda","failurerate","rate"}):
             ren[c] = "FIT"; have_fit = True
@@ -309,7 +305,7 @@ def parse_failure_csv_with_mapping(upload):
 
     st.success("Failure DB parsed.")
     st.dataframe(out.head(20), height=240)
-    return out, raw, c_share, c_fit
+    return out
 
 
 # ============================ Build components from NET ============================
@@ -325,15 +321,11 @@ def build_component_table_from_net(comp_pins_map: dict, ref_types: dict) -> pd.D
     return df
 
 
-# ============================ LLM classification only ============================
+# ============================ LLM label (goal used verbatim) ============================
 def label_llm(row: pd.Series, safety_goal_text: str, target_net: str,
-              nets, comp_pins_map, pin_name_map, node2net):
-    """
-    Returns (label, reason).
-    Uses the *exact* safety_goal_text from the UI as the goal definition.
-    """
+              nets, comp_pins_map, pin_name_map, node2net, include_voltage_hints: bool):
     if OAI is None:
-        return "NEEDS_REVIEW", "LLM not configured (set OPENAI_API_KEY in secrets)."
+        return "NEEDS_REVIEW", "LLM not configured (set OPENAI_API_KEY)."
 
     ref = str(row["RefDes"])
     pins = sorted(list(comp_pins_map.get(ref, [])))
@@ -343,21 +335,21 @@ def label_llm(row: pd.Series, safety_goal_text: str, target_net: str,
         info = pin_name_map.get((ref, p), {})
         pinctx.append({"pin": p, "name": info.get("name",""), "net": net})
 
-    # Small supply hints from net names (non-binding; goal text is authoritative)
-    def guess_v(name: str):
-        if not name: return None
-        n = name.lower()
-        if n in {"/b-","/gnd","gnd","ground","0v"}: return 0.0
-        if "12v" in n or n in {"/b+"}: return 12.0
-        m = re.search(r'(\d+(?:\.\d+)?)v', n)
-        try: return float(m.group(1)) if m else None
-        except: return None
-
+    # Optional, minimal voltage hints (can be disabled by toggle)
     supply_candidates = []
-    for n in {x["net"] for x in pinctx if x.get("net")}:
-        v = guess_v(n)
-        if v is not None:
-            supply_candidates.append({"net": n, "voltage_hint": v})
+    if include_voltage_hints:
+        def guess_v(name: str):
+            if not name: return None
+            n = name.lower()
+            if n in {"/b-","/gnd","gnd","ground","0v"}: return 0.0
+            if "12v" in n or n in {"/b+"}: return 12.0
+            m = re.search(r'(\d+(?:\.\d+)?)v', n)
+            try: return float(m.group(1)) if m else None
+            except: return None
+        for n in {x["net"] for x in pinctx if x.get("net")}:
+            v = guess_v(n)
+            if v is not None:
+                supply_candidates.append({"net": n, "voltage_hint": v})
 
     prompt = f"""
 You are an FMEDA safety expert. Perform single-fault propagation for the EXACT goal given below.
@@ -387,9 +379,7 @@ Return STRICT JSON only:
   "reason":"short, clear justification (<= 140 chars)"
 }}
 """
-
     try:
-        # Ask for JSON output; fall back robustly if API doesn't support response_format.
         try:
             r = OAI.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -410,31 +400,239 @@ Return STRICT JSON only:
         lab = str(data.get("label","NEEDS_REVIEW")).upper()
         rsn = str(data.get("reason",""))
         if lab not in {"SAFE","UNSAFE","NEEDS_REVIEW"}:
-            lab, rsn = "NEEDS_REVIEW", f"Invalid label from LLM: {lab}"
+            return "NEEDS_REVIEW", f"Invalid label: {lab}"
         return lab, rsn
     except Exception as e:
         return "NEEDS_REVIEW", f"LLM error: {e}"
 
 
-def compute_spfm(fmeda: pd.DataFrame, label_col: str) -> float | None:
+# ============================ SPFM & Sensitivity helpers ============================
+def compute_fit_eff(df: pd.DataFrame) -> pd.Series:
+    return (
+        pd.to_numeric(df["FIT"], errors="coerce").fillna(0.0)
+        * pd.to_numeric(df["Share"], errors="coerce").fillna(0.0)
+        * (1.0 - pd.to_numeric(df["DC"], errors="coerce").fillna(0.0).clip(0,1))
+    )
+
+def compute_spfm(fmeda: pd.DataFrame, label_col: str = "Label_llm") -> float | None:
     d = fmeda.copy()
-    d["FIT"]   = pd.to_numeric(d["FIT"], errors="coerce")
+    d["FIT_eff"] = compute_fit_eff(d)
+    lam_tot = d["FIT_eff"].sum()
+    lam_haz = d.loc[d[label_col].str.upper()=="UNSAFE", "FIT_eff"].sum()
+    if lam_tot <= 0: return None
+    return 1.0 - (lam_haz / lam_tot)
+
+def top_contributors(df: pd.DataFrame, label_col="Label_llm", top_n=10, include_nr=False):
+    d = df.copy()
+    d["FIT_eff"] = compute_fit_eff(d)
+    if include_nr:
+        mask = d[label_col].str.upper().isin(["UNSAFE","NEEDS_REVIEW"])
+    else:
+        mask = d[label_col].str.upper()=="UNSAFE"
+    d = d[mask].copy()
+    d["hazard_lambda"] = d["FIT_eff"]
+    d = d.sort_values("hazard_lambda", ascending=False)
+    return d.head(top_n)
+
+# Fallback rule-of-thumb measures
+def measures_for_row(row, goal_text: str):
+    comp = (row.get("ComponentType") or "").lower()
+    fm   = (row.get("FailureMode") or "").lower()
+    ideas = []
+    if "short" in fm:
+        ideas += [
+            "Add window comparator at OUT with latched shutdown",
+            "Series impedance/limiter (R/PTC/fuse) in hazardous path",
+            "Clamp (TVS/zener) to hold node on safe side",
+            "Rail supervision (OV/UV) forces safe state",
+        ]
+        if "mosfet" in comp:
+            ideas += ["Back-to-back MOSFETs in series to block body diode",
+                      "Gate clamp + proper gate resistors"]
+        if "diode" in comp:
+            ideas += ["Dual series diodes or series R before OUT"]
+        if "connector" in comp:
+            ideas += ["Pin re-ordering/spacing, guarded GND pins, harness fuse"]
+    elif "open" in fm:
+        ideas += [
+            "Fail-safe bias (pull-up/pull-down) so open drives safe state",
+            "Loss-of-drive detection + shutdown",
+        ]
+        if "resistor" in comp:
+            ideas += ["Split into series pair; one open keeps safe bias"]
+    else:
+        ideas += [
+            "Self-diagnostics (plausibility), watchdog on driver",
+            "Thermal margin or higher quality grade",
+        ]
+    return list(dict.fromkeys(ideas))
+
+
+# ============================ NEW: LLM Sensitivity & Mitigation Proposals ============================
+def build_hazard_context(df: pd.DataFrame, label_col="Label_llm", include_nr=False, max_rows=20):
+    d = df.copy()
+    d["FIT"] = pd.to_numeric(d["FIT"], errors="coerce")
     d["Share"] = pd.to_numeric(d["Share"], errors="coerce")
-    d["DC"]    = pd.to_numeric(d["DC"], errors="coerce").fillna(0.0).clip(0,1)
-    d["FIT_eff"] = d["FIT"] * d["Share"] * (1.0 - d["DC"])
-    valid = d["FIT_eff"].notna()
-    if not valid.any(): return None
-    lam_total = d.loc[valid, "FIT_eff"].sum()
-    lam_spf   = d.loc[valid & (d.get(label_col,"SAFE").str.upper()=="UNSAFE"), "FIT_eff"].sum()
-    if lam_total <= 0: return None
-    return 1.0 - (lam_spf / lam_total)
+    d["DC"] = pd.to_numeric(d["DC"], errors="coerce").clip(0,1)
+    d["FIT_eff"] = d["FIT"].fillna(0.0) * d["Share"].fillna(0.0) * (1.0 - d["DC"].fillna(0.0))
+    lam_total = d["FIT_eff"].sum()
+
+    labels = d[label_col].astype(str).str.upper()
+    hazard_mask = labels.eq("UNSAFE") | (include_nr & labels.eq("NEEDS_REVIEW"))
+    h = d.loc[hazard_mask, ["RefDes","ComponentType","FailureMode","FIT","Share","DC","FIT_eff",label_col,"Reason_llm"]].copy()
+    h = h.sort_values("FIT_eff", ascending=False).head(max_rows)
+
+    rows_ctx = []
+    for _, r in h.iterrows():
+        rows_ctx.append({
+            "RefDes": str(r["RefDes"]),
+            "ComponentType": str(r["ComponentType"]),
+            "FailureMode": str(r["FailureMode"]),
+            "Label": str(r[label_col]),
+            "Reason": str(r.get("Reason_llm","")),
+            "FIT": float(r["FIT"]) if pd.notna(r["FIT"]) else 0.0,
+            "Share": float(r["Share"]) if pd.notna(r["Share"]) else 0.0,
+            "DC": float(r["DC"]) if pd.notna(r["DC"]) else 0.0,
+            "FIT_eff": float(r["FIT_eff"]) if pd.notna(r["FIT_eff"]) else 0.0
+        })
+    return lam_total, rows_ctx, h
+
+def llm_sensitivity_proposals(goal_text: str, target_net: str, lam_total: float, rows_ctx: list[dict], top_k: int = 5):
+    if OAI is None:
+        return {"error": "LLM not configured (OPENAI_API_KEY missing)."}, None
+
+    schema_hint = {
+      "proposals": [
+        {
+          "rank": 1,
+          "RefDes": "D1",
+          "FailureMode": "Short",
+          "action": "IncreaseDC",
+          "change": {"delta_DC": 0.4},
+          "delta_spfm_est": 0.0123,
+          "rationale": "why this is effective",
+          "measures": ["specific 1","specific 2","specific 3"],
+          "effort": "low",
+          "side_effects": "short note"
+        }
+      ],
+      "notes": "assumptions and calculation steps"
+    }
+
+    prompt = f"""
+You are a functional safety engineer. Perform LLM-only sensitivity analysis for SPFM.
+
+SAFETY_GOAL (verbatim): {goal_text}
+TARGET_NET: {target_net}
+
+Math (use exactly):
+  λ_i = FIT_i * Share_i * (1 - DC_i)
+  Λ_tot = sum(FIT_i * Share_i * (1 - DC_i)) over all rows
+  Baseline SPFM = 1 - (sum λ_i for UNSAFE rows) / Λ_tot
+
+Small-change estimates for a single row i:
+  Increase DC by ΔDC_i:      ΔSPFM ≈ (λ_i / Λ_tot) * ΔDC_i
+  Reduce FIT by fraction a:  ΔSPFM ≈ (λ_i / Λ_tot) * a
+  Block propagation (make SAFE): ΔSPFM ≈ (λ_i / Λ_tot)
+  Redundancy that eliminates the single-point hazard: same as blocking.
+
+Data (JSON):
+- Λ_tot: {lam_total:.12g}
+- Candidate rows (UNSAFE and optionally NEEDS_REVIEW):
+{json.dumps(rows_ctx, ensure_ascii=False)}
+
+Task:
+1) Propose the TOP {top_k} actions maximizing ΔSPFM with realistic effort.
+2) For each action provide:
+   RefDes, FailureMode, action ∈ [IncreaseDC, ReduceFIT, BlockPropagation, Redundancy],
+   change (ΔDC or fit_reduction_frac or block:true),
+   delta_spfm_est (0..1),
+   3–6 concrete design measures, effort, side_effects.
+3) Sort desc by delta_spfm_est and rank 1..{top_k}. Max {top_k} items.
+4) Return STRICT JSON with keys like this schema:
+{json.dumps(schema_hint, ensure_ascii=False)}
+"""
+    try:
+        try:
+            r = OAI.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role":"user","content":prompt}],
+                temperature=0,
+                response_format={"type":"json_object"}
+            )
+            content = r.choices[0].message.content
+        except Exception:
+            r = OAI.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role":"user","content":prompt}],
+                temperature=0
+            )
+            content = r.choices[0].message.content
+
+        data = json.loads(content)
+        return data, None
+    except Exception as e:
+        return None, f"LLM error: {e}"
+
+def verify_proposals_math(proposals: list[dict], rows_ctx: list[dict], lam_total: float):
+    idx = {(r["RefDes"], r["FailureMode"]): float(r.get("FIT_eff", 0.0)) for r in rows_ctx}
+    checked = []
+    for p in proposals:
+        key = (str(p.get("RefDes","")), str(p.get("FailureMode","")))
+        lam_i = idx.get(key, 0.0)
+        change = p.get("change", {}) or {}
+        est = None
+        if change.get("block") is True:
+            est = lam_i / lam_total if lam_total > 0 else 0.0
+        elif "delta_DC" in change:
+            try: est = (lam_i / lam_total) * float(change["delta_DC"])
+            except Exception: est = None
+        elif "fit_reduction_frac" in change:
+            try: est = (lam_i / lam_total) * float(change["fit_reduction_frac"])
+            except Exception: est = None
+        checked.append({
+            "RefDes": p.get("RefDes",""),
+            "FailureMode": p.get("FailureMode",""),
+            "action": p.get("action",""),
+            "LLM_delta_spfm_est": p.get("delta_spfm_est", None),
+            "Our_delta_spfm_est": est,
+            "Measures": p.get("measures", []),
+            "effort": p.get("effort",""),
+            "side_effects": p.get("side_effects",""),
+        })
+    return pd.DataFrame(checked)
+
+def apply_proposals_to_scenario(df: pd.DataFrame, proposals: list[dict], label_col="Label_llm"):
+    scen = df.copy()
+    scen["FIT"] = pd.to_numeric(scen["FIT"], errors="coerce")
+    scen["Share"] = pd.to_numeric(scen["Share"], errors="coerce")
+    scen["DC"] = pd.to_numeric(scen["DC"], errors="coerce").clip(0,1)
+    scen[label_col] = scen[label_col].astype(str).str.upper()
+
+    for p in proposals:
+        ref = str(p.get("RefDes",""))
+        fm  = str(p.get("FailureMode",""))
+        change = p.get("change", {}) or {}
+        mask = (scen["RefDes"].astype(str)==ref) & (scen["FailureMode"].astype(str)==fm)
+        if not mask.any(): continue
+        if change.get("block") is True:
+            scen.loc[mask, label_col] = "SAFE"
+        if "delta_DC" in change:
+            scen.loc[mask, "DC"] = (scen.loc[mask, "DC"] + float(change["delta_DC"])).clip(0,1)
+        if "fit_reduction_frac" in change:
+            scen.loc[mask, "FIT"] = scen.loc[mask, "FIT"] * (1.0 - float(change["fit_reduction_frac"]))
+
+    scen["FIT_eff"] = scen["FIT"].fillna(0.0) * scen["Share"].fillna(0.0) * (1.0 - scen["DC"].fillna(0.0))
+    scen_spfm = compute_spfm(scen, label_col)
+    return scen, scen_spfm
 
 
 # ============================ UI ============================
-st.title("FMEDA — KiCad .net • LLM-only propagation")
+st.title("Safety Co-Pilot — FMEDA + Sensitivity (LLM only)")
 
 safety_goal = st.text_input("Safety Goal (verbatim, used as-is by the LLM)",
                             "Prevent unintended >5 V at OUT")
+include_hints = st.toggle("Include voltage hints from net names", value=False)
 
 c0, c1 = st.columns([1,1])
 with c0:
@@ -442,28 +640,28 @@ with c0:
 with c1:
     fail_file = st.file_uploader("Upload Failure Rates & Modes (CSV)", type=["csv"])
 
-if net_file:
+if net_file and fail_file:
+    # Parse NET
     try:
         nets, comp_pins_map, pin_name_map, ref_types = parse_kicad_net(net_file.read())
     except Exception as e:
-        st.error(f"Failed to parse .net (S-expression/XML): {e}")
+        st.error(f"Failed to parse .net: {e}")
         st.stop()
-
-    if not comp_pins_map:
-        st.error("Parsed 0 components from the .net. Confirm this is a KiCad netlist (not SPICE).")
-        st.stop()
-
     node2net = invert_node_to_net(nets)
-    st.success(f"Parsed NET: {len(nets)} nets • {len(comp_pins_map)} components • {len(pin_name_map)} pin-name entries.")
 
+    # Components from NET
     comp_df = build_component_table_from_net(comp_pins_map, ref_types)
     st.subheader("NET components (edit types if needed)")
     comp_df = st.data_editor(
         comp_df[["RefDes","ComponentType","ct_norm"]].rename(columns={"ct_norm":"_norm (read-only)"}),
         disabled=["_norm (read-only)"],
-        height=320
+        height=280
     )
     comp_df["ct_norm"] = comp_df["ComponentType"].map(_norm)
+
+    # Failure DB
+    st.subheader("Failure DB preview & mapping")
+    failure_df = parse_failure_csv_with_mapping(fail_file)
 
     # Target net selection
     net_names = sorted(nets.keys(), key=lambda x: x.lower())
@@ -473,99 +671,247 @@ if net_file:
             default_idx = i; break
     target_net = st.selectbox("Target net (from NET)", net_names, index=default_idx if net_names else 0)
 
-    if fail_file:
-        st.subheader("Failure DB preview & mapping")
-        failure_df, raw_df_debug, col_share_name, col_fit_name = parse_failure_csv_with_mapping(fail_file)
+    st.divider()
+    if st.button("Build FMEDA with LLM"):
+        if OAI is None:
+            st.error("LLM not configured. Add OPENAI_API_KEY to Streamlit secrets.")
+            st.stop()
 
-        # quick parse debug
-        rs = raw_df_debug[col_share_name].astype(str)
-        rf = raw_df_debug[col_fit_name].astype(str)
-        preview = pd.DataFrame({
-            "Share_raw": rs.head(8).tolist(),
-            "FIT_raw":   rf.head(8).tolist(),
-        })
-        st.write("Parsing preview (first few rows):")
-        st.dataframe(preview, height=180)
+        # Expand FMEDA (merge by normalized type)
+        fmeda = comp_df.merge(failure_df, how="left", on="ct_norm", suffixes=("_comp","_db"))
+        # Prefer ComponentType from NET
+        if "ComponentType_comp" in fmeda.columns:
+            fmeda = fmeda.rename(columns={"ComponentType_comp":"ComponentType"})
+        fmeda = fmeda[["RefDes","ComponentType","FailureMode","Share","FIT","DC","Detectable","DiagnosticName"]]
 
-        st.divider()
-        run = st.button("Build FMEDA with LLM")
-        if run:
-            if OAI is None:
-                st.error("LLM not configured. Set OPENAI_API_KEY in Streamlit secrets.")
-                st.stop()
-
-            # Expand FMEDA
-            fmeda = comp_df.merge(failure_df, how="left", on="ct_norm", suffixes=("_comp","_db"))
-            fmeda = fmeda[["RefDes","ComponentType_comp","FailureMode","Share","FIT","DC","Detectable","DiagnosticName"]] \
-                         .rename(columns={"ComponentType_comp":"ComponentType"})
-
-            # Fill missing Share equally per (RefDes, ComponentType)
-            fmeda["Share"] = pd.to_numeric(fmeda["Share"], errors="coerce")
-            mask_na = fmeda["Share"].isna()
-            if mask_na.any():
-                eq = (
-                    fmeda[mask_na]
-                    .groupby(["RefDes","ComponentType"], dropna=False)["Share"]
-                    .transform(lambda s: 1.0 / len(s) if len(s) else 1.0)
-                )
-                fmeda.loc[mask_na, "Share"] = eq
-
-            fmeda["DC"] = pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0).clip(0,1)
-            fmeda["FIT_eff"] = (
-                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(0.0)
-                * fmeda["Share"].astype(float)
-                * (1.0 - fmeda["DC"].astype(float))
+        # Fill Share within each (RefDes, ComponentType)
+        fmeda["Share"] = pd.to_numeric(fmeda["Share"], errors="coerce")
+        mask_na = fmeda["Share"].isna()
+        if mask_na.any():
+            eq = (
+                fmeda[mask_na]
+                .groupby(["RefDes","ComponentType"], dropna=False)["Share"]
+                .transform(lambda s: 1.0 / len(s) if len(s) else 1.0)
             )
+            fmeda.loc[mask_na, "Share"] = eq
 
-            # LLM pass
-            labels, reasons = [], []
-            prog = st.progress(0.0, text="Classifying with LLM…")
-            total = len(fmeda)
-            for idx, (_, row) in enumerate(fmeda.iterrows(), start=1):
-                lab, rsn = label_llm(row, safety_goal, target_net, nets, comp_pins_map, pin_name_map, node2net)
-                labels.append(lab); reasons.append(rsn)
-                prog.progress(idx/total, text=f"Classifying with LLM… {idx}/{total}")
-                # tiny sleep to avoid rate spikes; adjust as needed
-                sleep(0.02)
-            fmeda["Label_llm"]  = labels
-            fmeda["Reason_llm"] = reasons
+        fmeda["DC"] = pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0).clip(0,1)
+        fmeda["FIT_eff"] = compute_fit_eff(fmeda)
 
-            spfm_llm = compute_spfm(fmeda, label_col="Label_llm")
-            if spfm_llm is not None:
-                st.metric("SPFM (LLM)", f"{spfm_llm*100:.2f}%")
-            else:
-                st.info("SPFM (LLM) not computable (no valid FIT×Share).")
+        # LLM labelling
+        labels, reasons = [], []
+        prog = st.progress(0.0, text="Classifying with LLM…")
+        total = len(fmeda)
+        for idx, (_, row) in enumerate(fmeda.iterrows(), start=1):
+            lab, rsn = label_llm(row, safety_goal, target_net, nets, comp_pins_map, pin_name_map, node2net, include_hints)
+            labels.append(lab); reasons.append(rsn)
+            prog.progress(idx/total, text=f"Classifying with LLM… {idx}/{total}")
+            time.sleep(0.01)
+        fmeda["Label_llm"]  = labels
+        fmeda["Reason_llm"] = reasons
 
-            st.subheader("FMEDA — LLM result")
-            st.dataframe(
-                fmeda[[
-                    "RefDes","ComponentType","FailureMode","Share","FIT","DC",
-                    "Label_llm","Reason_llm","FIT_eff"
-                ]],
-                height=560, use_container_width=True
+        base_spfm = compute_spfm(fmeda, "Label_llm")
+        st.metric("Baseline SPFM (LLM)", f"{(base_spfm*100):.2f}%" if base_spfm is not None else "n/a")
+
+        st.subheader("FMEDA — LLM result")
+        st.dataframe(
+            fmeda[["RefDes","ComponentType","FailureMode","Share","FIT","DC","Label_llm","Reason_llm","FIT_eff"]],
+            height=480, use_container_width=True
+        )
+
+        # ---------------------- Manual Sensitivity (optional knobs) ----------------------
+        st.header("Sensitivity Analysis (manual what-ifs)")
+        with st.expander("How it works", expanded=False):
+            st.markdown(
+                "- **FIT_eff = FIT × Share × (1 − DC)** per row.\n"
+                "- Rows labeled **UNSAFE** by the LLM contribute to the hazardous sum.\n"
+                "- Adjust **DC**, **FIT**, or **block propagation** for top contributors; we recompute SPFM.\n"
             )
+        include_nr = st.toggle("Treat NEEDS_REVIEW rows as hazardous in sensitivity", value=False)
+        top_n = st.slider("Top contributors to adjust", min_value=3, max_value=30, value=10, step=1)
 
-            # Downloads
-            csv_bytes = fmeda.to_csv(index=False).encode("utf-8")
-            st.download_button("Download FMEDA (CSV)", csv_bytes, "fmeda_llm_only.csv","text/csv")
+        top = top_contributors(fmeda, "Label_llm", top_n=top_n, include_nr=include_nr)
+        if top.empty:
+            st.info("No contributors selected. If most rows are SAFE, widen Top N or include NEEDS_REVIEW.")
+        else:
+            st.write("Top contributors by hazardous λ (descending):")
+            st.dataframe(top[["RefDes","ComponentType","FailureMode","FIT","Share","DC","Label_llm","hazard_lambda"]],
+                         use_container_width=True, height=320)
 
-            if EXCEL_ENABLED:
-                xbuf = io.BytesIO()
-                with pd.ExcelWriter(xbuf, engine="xlsxwriter") as xw:
-                    fmeda.to_excel(xw, index=False, sheet_name="FMEDA")
-                    meta = {
-                        "SafetyGoal_verbatim": safety_goal,
-                        "TargetNet": target_net,
-                        "Model": OPENAI_MODEL,
-                    }
-                    pd.DataFrame([meta]).to_excel(xw, index=False, sheet_name="Summary")
-                st.download_button("Download FMEDA (XLSX)",
-                                   xbuf.getvalue(),
-                                   "fmeda_llm_only.xlsx",
-                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                st.info("Excel export disabled (install `xlsxwriter`).")
-    else:
-        st.info("Upload the Failure Rates & Modes CSV to proceed.")
+            st.subheader("Scenario knobs")
+            colA, colB, colC = st.columns(3)
+            with colA:
+                global_dc_up = st.slider("Global DC increase on selected rows", 0.0, 0.9, 0.0, 0.05)
+            with colB:
+                global_fit_down_pct = st.slider("Global FIT reduction (%) on selected rows", 0, 90, 0, 5)
+            with colC:
+                block_all = st.checkbox("Block propagation for ALL selected rows (make SAFE)")
+
+            per_row_changes = {}
+            st.caption("Optional per-row overrides:")
+            for i, r in top.reset_index(drop=True).iterrows():
+                with st.expander(f"{r.RefDes} — {r.ComponentType} — {r.FailureMode}", expanded=False):
+                    c1, c2, c3 = st.columns([1,1,1])
+                    with c1:
+                        dc_up = st.slider(f"ΔDC for {r.RefDes}", 0.0, 0.9, global_dc_up, 0.05, key=f"dc_{i}")
+                    with c2:
+                        fit_down = st.slider(f"FIT ↓ (%) for {r.RefDes}", 0, 90, global_fit_down_pct, 5, key=f"fit_{i}")
+                    with c3:
+                        block = st.checkbox(f"Block propagation ({r.RefDes})", value=block_all, key=f"blk_{i}")
+                    per_row_changes[(r.RefDes, r.FailureMode)] = {"dc_up": dc_up, "fit_down_pct": fit_down, "block": block}
+
+            if st.button("Recompute scenario SPFM"):
+                scen = fmeda.copy()
+                scen["FIT"] = pd.to_numeric(scen["FIT"], errors="coerce")
+                scen["Share"] = pd.to_numeric(scen["Share"], errors="coerce")
+                scen["DC"] = pd.to_numeric(scen["DC"], errors="coerce").clip(0,1)
+                scen["Label_llm"] = scen["Label_llm"].astype(str).str.upper()
+
+                for (ref, fm), ch in per_row_changes.items():
+                    mask = (scen["RefDes"]==ref) & (scen["FailureMode"]==fm)
+                    if ch["block"]:
+                        scen.loc[mask, "Label_llm"] = "SAFE"
+                    scen.loc[mask, "DC"] = (scen.loc[mask, "DC"] + ch["dc_up"]).clip(0,1)
+                    k = 1.0 - (ch["fit_down_pct"]/100.0)
+                    scen.loc[mask, "FIT"] = scen.loc[mask, "FIT"] * k
+
+                scen["FIT_eff"] = compute_fit_eff(scen)
+                scen_spfm = compute_spfm(scen, "Label_llm")
+
+                st.metric("Scenario SPFM (LLM)", f"{(scen_spfm*100):.2f}%" if scen_spfm is not None else "n/a",
+                          delta=f"{((scen_spfm - base_spfm)*100):+.2f}%" if (scen_spfm is not None and base_spfm is not None) else None)
+
+                st.write("Changed rows:")
+                changed = scen.merge(fmeda, on=["RefDes","FailureMode"], suffixes=("_scen","_base"))
+                changed = changed[
+                    (changed["DC_scen"]!=changed["DC_base"]) |
+                    (changed["FIT_scen"]!=changed["FIT_base"]) |
+                    (changed["Label_llm_scen"]!=changed["Label_llm_base"])
+                ][["RefDes","ComponentType_base","FailureMode",
+                   "FIT_base","FIT_scen","DC_base","DC_scen","Label_llm_base","Label_llm_scen","FIT_eff_base","FIT_eff_scen"]]
+                st.dataframe(changed, use_container_width=True, height=360)
+
+                st.download_button("Download scenario FMEDA (CSV)",
+                                   scen.to_csv(index=False).encode("utf-8"),
+                                   "fmeda_scenario.csv","text/csv")
+
+        # ---------------------- Design Measures (rule-of-thumb + optional LLM) ----------------------
+        st.header("Design Measures")
+        st.caption("Target the few top contributors. Mix detection (DC↑), path blocking, and FIT reduction.")
+        top_for_measures = top_contributors(fmeda, "Label_llm", top_n=8, include_nr=False)
+
+        fallback = []
+        for _, r in top_for_measures.iterrows():
+            fallback.append({
+                "RefDes": r.RefDes,
+                "FailureMode": r.FailureMode,
+                "Measures": measures_for_row(r, safety_goal)
+            })
+
+        use_llm_measures = st.toggle("Ask LLM for tailored measures", value=False, help="Needs OPENAI_API_KEY")
+        final_measures = []
+        if use_llm_measures and OAI is not None:
+            rows_json = []
+            for _, r in top_for_measures.iterrows():
+                rows_json.append({
+                    "RefDes": r.RefDes,
+                    "ComponentType": r.ComponentType,
+                    "FailureMode": r.FailureMode,
+                    "HazardLambda": float(r.hazard_lambda),
+                    "ReasonLLM": r.get("Reason_llm","")
+                })
+            # reuse the LLM used later; keep simple per-row generation here
+            try:
+                prompt = f"""You are a safety engineer. For each of these rows, propose 3–6 concise, realistic design measures.
+SAFETY_GOAL: {safety_goal}
+ROWS: {json.dumps(rows_json, ensure_ascii=False)}
+Return JSON list of {{"RefDes":"","FailureMode":"","Measures":["..."]}} only."""
+                try:
+                    rrr = OAI.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[{"role":"user","content":prompt}],
+                        temperature=0,
+                        response_format={"type":"json_object"}
+                    )
+                    content = rrr.choices[0].message.content
+                except Exception:
+                    rrr = OAI.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[{"role":"user","content":prompt}],
+                        temperature=0
+                    )
+                    content = rrr.choices[0].message.content
+                items = json.loads(content)
+                if isinstance(items, list):
+                    by_key = {(d.get("RefDes",""), d.get("FailureMode","")): d for d in items}
+                    for f in fallback:
+                        key = (f["RefDes"], f["FailureMode"])
+                        if key in by_key and isinstance(by_key[key].get("Measures"), list) and by_key[key]["Measures"]:
+                            final_measures.append(by_key[key])
+                        else:
+                            final_measures.append(f)
+                else:
+                    final_measures = fallback
+            except Exception:
+                final_measures = fallback
+        else:
+            final_measures = fallback
+
+        meas_df = pd.DataFrame([{"RefDes":m["RefDes"], "FailureMode":m["FailureMode"],
+                                 "Measures": " • ".join(m["Measures"])} for m in final_measures])
+        st.dataframe(meas_df, use_container_width=True, height=320)
+        st.download_button("Download measures (CSV)",
+                           meas_df.to_csv(index=False).encode("utf-8"),
+                           "design_measures.csv","text/csv")
+
+        # ---------------------- LLM Sensitivity & Mitigation Proposals (Top-5 by ΔSPFM) ----------------------
+        st.header("LLM Sensitivity & Mitigation Proposals (Top-5 by effectiveness)")
+
+        include_nr_for_llm = st.toggle("Allow LLM to consider NEEDS_REVIEW rows as hazardous", value=False)
+        max_candidates = st.slider("Rows to provide to LLM (ranked by λ)", 5, 40, 20, 1)
+        top_k_actions  = st.slider("Top actions to request from LLM", 3, 10, 5, 1)
+
+        lam_total, rows_ctx, _top_df = build_hazard_context(
+            fmeda, label_col="Label_llm", include_nr=include_nr_for_llm, max_rows=max_candidates
+        )
+
+        if OAI is None:
+            st.warning("LLM not configured. Set OPENAI_API_KEY in secrets to enable this feature.")
+        else:
+            if st.button("Ask LLM for Top actions"):
+                llm_out, err = llm_sensitivity_proposals(safety_goal, target_net, lam_total, rows_ctx, top_k=top_k_actions)
+                if err:
+                    st.error(err)
+                elif not llm_out or "proposals" not in llm_out:
+                    st.error("LLM returned no proposals or invalid JSON.")
+                else:
+                    props = llm_out.get("proposals", [])
+                    st.subheader("LLM Top actions (raw JSON)")
+                    st.json(llm_out, expanded=False)
+
+                    vdf = verify_proposals_math(props, rows_ctx, lam_total)
+                    vdf["LLM_delta_spfm_est_%"] = pd.to_numeric(vdf["LLM_delta_spfm_est"], errors="coerce").fillna(0.0) * 100.0
+                    vdf["Our_delta_spfm_est_%"] = pd.to_numeric(vdf["Our_delta_spfm_est"], errors="coerce").fillna(0.0) * 100.0
+                    st.subheader("Checked actions (ΔSPFM estimates)")
+                    st.dataframe(
+                        vdf[["RefDes","FailureMode","action","LLM_delta_spfm_est_%","Our_delta_spfm_est_%","effort","side_effects","Measures"]],
+                        use_container_width=True, height=360
+                    )
+
+                    if st.button("Apply Top actions and recompute SPFM"):
+                        scen, scen_spfm = apply_proposals_to_scenario(fmeda, props, label_col="Label_llm")
+                        st.metric(
+                            "Scenario SPFM (after applying LLM actions)",
+                            f"{(scen_spfm*100):.2f}%" if scen_spfm is not None else "n/a",
+                            delta=f"{((scen_spfm - base_spfm)*100):+.2f}%" if (scen_spfm is not None and base_spfm is not None) else None
+                        )
+                        st.dataframe(
+                            scen[["RefDes","ComponentType","FailureMode","FIT","Share","DC","Label_llm","FIT_eff"]],
+                            use_container_width=True, height=360
+                        )
+                        st.download_button("Download scenario FMEDA (CSV)",
+                                           scen.to_csv(index=False).encode("utf-8"),
+                                           "fmeda_llm_scenario.csv","text/csv")
+
 else:
-    st.info("Upload a KiCad .net (S-expression/XML) and the Failure DB (CSV) to build FMEDA.")
+    st.info("Upload a KiCad .net and a Failure DB CSV to start.")

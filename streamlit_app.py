@@ -89,9 +89,24 @@ def _token_alt(key):
     return rf'\({key}\s+("([^"]+)"|[^\s\)]+)\)'
 
 def _pick(m, quoted_idx=2, any_idx=1):
-    # prefer quoted group if present, else the unquoted; then strip quotes
-    if m is None: return ""
-    val = m.group(quoted_idx) if m.group(quoted_idx) is not None else m.group(any_idx)
+    """
+    Safely pick a capture from a regex Match:
+    - prefer the quoted capture (e.g., group 2) else the unquoted token (group 1)
+    - return "" if neither exists (avoids calling .strip on None)
+    """
+    if m is None:
+        return ""
+    try:
+        val_q = m.group(quoted_idx)
+    except IndexError:
+        val_q = None
+    try:
+        val_a = m.group(any_idx)
+    except IndexError:
+        val_a = None
+    val = val_q if val_q is not None else val_a
+    if val is None:
+        return ""
     return val.strip('"')
 
 def parse_kicad_net(net_bytes: bytes):
@@ -179,6 +194,8 @@ def parse_kicad_net(net_bytes: bytes):
         for nm in node_re.finditer(net_blk):
             ref = _pick(nm, quoted_idx=2, any_idx=1)
             pin = _pick(nm, quoted_idx=4, any_idx=3)
+            if not ref or not pin:
+                continue
             nets[net_name].add((ref, pin))
             comp_pins[ref].add(pin)
             pfunc = _pick(nm, quoted_idx=6, any_idx=5)

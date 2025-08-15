@@ -588,4 +588,120 @@ if net_file:
         disabled=["_norm (read-only)"],
         height=320
     )
-    comp_df["ct_norm"] = comp_]()_
+    comp_df["ct_norm"] = comp_df["ComponentType"].map(_norm)
+
+    # Target net from dropdown
+    net_names = sorted(nets.keys(), key=lambda x: x.lower())
+    default_idx = 0
+    for i, n in enumerate(net_names):
+        if "out" in n.lower():
+            default_idx = i; break
+    target_net = st.selectbox("Target net (from NET)", net_names, index=default_idx if net_names else 0)
+
+    if fail_file:
+        st.subheader("Failure DB preview & mapping")
+        failure_df, raw_df_debug, col_share_name, col_fit_name = parse_failure_csv_with_mapping(fail_file)
+        debug_numeric_preview(raw_df_debug, col_share_name, col_fit_name)
+        st.divider()
+
+        if st.button("Build FMEDA (NET-only)"):
+            fmeda = expand_fmeda(comp_df, failure_df)
+
+            # Fill missing Share equally per (RefDes, ComponentType)
+            fmeda["Share"] = pd.to_numeric(fmeda["Share"], errors="coerce")
+            mask_na = fmeda["Share"].isna()
+            if mask_na.any():
+                eq = (
+                    fmeda[mask_na]
+                    .groupby(["RefDes","ComponentType"], dropna=False)["Share"]
+                    .transform(lambda s: 1.0 / len(s) if len(s) else 1.0)
+                )
+                fmeda.loc[mask_na, "Share"] = eq
+
+            # DC defaults 0
+            fmeda["DC"] = pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0).clip(0,1)
+
+            # Deterministic labels
+            labels_rules, reasons_rules = [], []
+            for _, row in fmeda.iterrows():
+                if pd.isna(row["FIT"]) or pd.isna(row["Share"]):
+                    labels_rules.append("UNASSESSED"); reasons_rules.append("Missing FIT/Share or unknown type")
+                    continue
+                lab, rsn = label_rules(row, nets, comp_pins_map, pin_name_map, node2net, target_net, threshold_v)
+                labels_rules.append(lab); reasons_rules.append(rsn)
+            fmeda["Label_rules"]  = labels_rules
+            fmeda["Reason_rules"] = reasons_rules
+
+            # LLM labels (optional)
+            if use_llm:
+                labels_llm, reasons_llm = [], []
+                for _, row in fmeda.iterrows():
+                    if pd.isna(row["FIT"]) or pd.isna(row["Share"]):
+                        labels_llm.append("UNASSESSED"); reasons_llm.append("Missing FIT/Share or unknown type")
+                        continue
+                    lab, rsn = label_llm(row, safety_goal, target_net, nets, comp_pins_map, pin_name_map, node2net, threshold_v)
+                    labels_llm.append(lab); reasons_llm.append(rsn)
+                fmeda["Label_llm"]  = labels_llm
+                fmeda["Reason_llm"] = reasons_llm
+                fmeda["Label_diff"] = (fmeda["Label_rules"].astype(str).str.upper()
+                                       != fmeda["Label_llm"].astype(str).str.upper())
+            else:
+                fmeda["Label_llm"] = ""
+                fmeda["Reason_llm"] = ""
+                fmeda["Label_diff"] = False
+
+            # Effective FIT (for metrics)
+            fmeda["FIT_eff"] = (
+                pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(pd.NA)
+                * pd.to_numeric(fmeda["Share"], errors="coerce").fillna(pd.NA)
+                * (1.0 - pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0))
+            )
+
+            # Metrics
+            spfm_rules = compute_spfm(fmeda, label_col="Label_rules")
+            if spfm_rules is not None:
+                st.metric("SPFM (Rules)", f"{spfm_rules*100:.2f}%")
+            else:
+                st.info("SPFM (Rules) not computable (no valid FIT×Share).")
+
+            if use_llm:
+                spfm_llm = compute_spfm(fmeda, label_col="Label_llm")
+                if spfm_llm is not None:
+                    st.metric("SPFM (LLM)", f"{spfm_llm*100:.2f}%")
+                else:
+                    st.info("SPFM (LLM) not computable (no valid FIT×Share).")
+
+            st.subheader("FMEDA — NET-only • Rules vs LLM")
+            st.dataframe(
+                fmeda[[
+                    "RefDes","ComponentType","FailureMode","Share","FIT","DC",
+                    "Label_rules","Reason_rules","Label_llm","Reason_llm","Label_diff","FIT_eff"
+                ]],
+                height=560, use_container_width=True
+            )
+
+            st.download_button("Download FMEDA (CSV)",
+                               fmeda.to_csv(index=False).encode("utf-8"),
+                               "fmeda_results.csv","text/csv")
+
+            if EXCEL_ENABLED:
+                xbuf = io.BytesIO()
+                with pd.ExcelWriter(xbuf, engine="xlsxwriter") as xw:
+                    fmeda.to_excel(xw, index=False, sheet_name="FMEDA")
+                    meta = {
+                        "SafetyGoal": safety_goal,
+                        "Threshold_V": threshold_v,
+                        "TargetNet": target_net,
+                        "LLM_Enabled": use_llm
+                    }
+                    pd.DataFrame([meta]).to_excel(xw, index=False, sheet_name="Summary")
+                st.download_button("Download FMEDA (XLSX)",
+                                   xbuf.getvalue(),
+                                   "fmeda_results.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.info("Excel export disabled (install `xlsxwriter`).")
+    else:
+        st.info("Upload the Failure Rates & Modes CSV to proceed.")
+else:
+    st.info("Upload a KiCad NET (.net XML) and the Failure DB (CSV) to build the FMEDA.")

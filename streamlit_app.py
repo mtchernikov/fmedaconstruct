@@ -411,4 +411,3 @@ if sch_file:
                         "Install it to enable XLSX downloads: `pip install xlsxwriter`")
 else:
     st.info("Upload a KiCad 9 schematic to start.")
-

@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
 import re, io, csv, json
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 # ============================ App config ============================
-st.set_page_config(page_title="FMEDA (NET-only) — Rules vs LLM", layout="wide")
-OPENAI_MODEL = "gpt-4o"  # used only if LLM comparison is enabled
+st.set_page_config(page_title="FMEDA (KiCad .net S-expression) — Rules vs LLM", layout="wide")
+OPENAI_MODEL = "gpt-4o"  # only used if LLM comparison is enabled
 
 # Optional OpenAI client
 try:
@@ -22,7 +21,7 @@ try:
 except Exception:
     EXCEL_ENABLED = False
 
-# ============================ Generic helpers ============================
+# ============================ Small utils ============================
 _num_pat = re.compile(r'([-+]?\d*[\.,]?\d+(?:[eE][-+]?\d+)?)')
 def _norm(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (str(s) if s is not None else "").strip().lower())
@@ -45,64 +44,153 @@ def parse_share_series(s: pd.Series) -> pd.Series:
         nums = nums / 100.0
     return nums
 
-# ============================ KiCad NET parser (XML, incl. lib pin names) ============================
-def parse_kicad_net(xml_bytes: bytes):
+# ============================ S-expression helpers ============================
+def _iter_blocks(text: str, tag: str):
+    """Yield s-expr blocks starting with '({tag}' at balanced parens depth."""
+    needle = f"({tag}"
+    i = text.find(needle)
+    n = len(text)
+    while i != -1:
+        depth = 0; start = i; j = i
+        while j < n:
+            ch = text[j]
+            if ch == "(": depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    yield text[start:j+1]; break
+            j += 1
+        i = text.find(needle, j)
+
+# ============================ Type inference ============================
+REF_PREFIX = {
+    "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
+    "Q":"MOSFET","T":"BJT","U":"IC","A":"OpAmp","K":"Relay","F":"Fuse",
+    "J":"Connector","X":"Connector",
+}
+def infer_type_from_ref_or_value(ref: str, value: str) -> str:
+    m = re.match(r'^([A-Za-z]+)', ref or "")
+    if m:
+        pref = m.group(1).upper()
+        for p in sorted(REF_PREFIX, key=lambda x: -len(x)):
+            if pref.startswith(p): return REF_PREFIX[p]
+    t = (value or "").lower()
+    if re.search(r'(^|\s)\d+(\.\d+)?(r|k|m)?(\s*ohm|$)', t): return "Resistor"
+    if re.search(r'(^|\s)\d+(\.\d+)?(n|u|µ|p|f)(\s*|$)', t): return "Capacitor"
+    if "opamp" in t: return "OpAmp"
+    if "comparator" in t or "comp" in t: return "Comparator"
+    if "mos" in t or "nmos" in t or "pmos" in t: return "MOSFET"
+    if "diode" in t or t.startswith("1n") or t.startswith("sb"): return "Diode"
+    return "Other"
+
+# ============================ NET parser (S-expression + XML fallback) ============================
+def parse_kicad_net(net_bytes: bytes):
     """
+    Supports KiCad 6/7/8/9 .net in S-expression and XML.
     Returns:
-      nets:           dict[str, set[(ref,pin_num)]]
-      comp_pins_map:  dict[ref] -> set(pin_numbers_as_str)
-      pin_name_map:   dict[(ref,pin_num)] -> {"name": str, "type": str}
-      ref_types:      dict[ref] -> inferred type from lib/part/value if available
+      nets:          dict[str, set[(ref,pin)]]
+      comp_pins_map: dict[ref] -> set(pin)
+      pin_name_map:  dict[(ref,pin)] -> {"name": str, "type": str}
+      ref_types:     dict[ref] -> inferred component type
     """
+    text = net_bytes.decode("utf-8", errors="ignore").strip()
+    # ---------- XML path ----------
+    if text.startswith("<"):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(text)
+        nets = defaultdict(set)
+        comp_pins = defaultdict(set)
+        pin_name_map = {}
+        ref_to_libpart = {}
+        ref_types = {}
+
+        for comp in root.findall(".//components/comp"):
+            ref = comp.get("ref") or ""
+            if not ref: continue
+            val = (comp.findtext("./value") or "").strip().lower()
+            ref_types[ref] = infer_type_from_ref_or_value(ref, val)
+            ls = comp.find("./libsource")
+            if ls is not None:
+                ref_to_libpart[ref] = (ls.get("lib") or "", ls.get("part") or "")
+
+        libpart_pins = {}
+        for lp in root.findall(".//libparts/libpart"):
+            lib = lp.get("lib") or ""
+            part= lp.get("part") or ""
+            pins = {}
+            for p in lp.findall("./pins/pin"):
+                num  = p.get("num") or ""
+                name = p.get("name") or ""
+                ptype= p.get("type") or ""
+                if num:
+                    pins[str(num)] = {"name": name, "type": ptype}
+            libpart_pins[(lib,part)] = pins
+
+        for net in root.findall(".//nets/net"):
+            name = net.get("name") or ""
+            for node in net.findall("./node"):
+                ref = node.get("ref") or ""
+                pin = node.get("pin") or ""
+                if ref and pin:
+                    nets[name].add((ref, pin))
+                    comp_pins[ref].add(pin)
+                    if ref in ref_to_libpart:
+                        pinfo = libpart_pins.get(ref_to_libpart[ref], {}).get(str(pin))
+                        if pinfo: pin_name_map[(ref, str(pin))] = pinfo
+
+        return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
+
+    # ---------- S-expression path ----------
     nets = defaultdict(set)
     comp_pins = defaultdict(set)
     pin_name_map = {}
-    ref_to_libpart = {}
     ref_types = {}
+    ref_to_libpart = {}
 
-    root = ET.fromstring(xml_bytes)
-
-    # components (may include value, fields)
-    for comp in root.findall(".//components/comp"):
-        ref = comp.get("ref") or ""
-        if not ref: continue
-        ls = comp.find("./libsource")
-        if ls is not None:
-            ref_to_libpart[ref] = (ls.get("lib") or "", ls.get("part") or "")
-        # try infer type from value or fields as basic fallback (R/C/L/Q/D/U…)
-        val = (comp.findtext("./value") or "").strip().lower()
+    # components → ref/value/libsource
+    for comp_blk in _iter_blocks(text, "comp"):
+        m_ref = re.search(r'\(ref\s+([^\s\)]+)\)', comp_blk)
+        if not m_ref: continue
+        ref = m_ref.group(1)
+        m_val = re.search(r'\(value\s+("[^"]+"|[^\s\)]+)\)', comp_blk)
+        val = (m_val.group(1).strip('"') if m_val else "").lower()
         ref_types[ref] = infer_type_from_ref_or_value(ref, val)
+        m_lib = re.search(r'\(libsource\s+\(lib\s+"([^"]*)"\)\s+\(part\s+"([^"]*)"\)', comp_blk)
+        if m_lib:
+            ref_to_libpart[ref] = (m_lib.group(1), m_lib.group(2))
 
-    # libparts -> pins (names/types)
+    # libparts → pin names
     libpart_pins = {}
-    for lp in root.findall(".//libparts/libpart"):
-        lib = lp.get("lib") or ""
-        part= lp.get("part") or ""
+    for lp_blk in _iter_blocks(text, "libpart"):
+        m_lib = re.search(r'\(lib\s+"([^"]*)"\)', lp_blk)
+        m_part= re.search(r'\(part\s+"([^"]*)"\)', lp_blk)
+        lib = m_lib.group(1) if m_lib else ""
+        part= m_part.group(1) if m_part else ""
         pins = {}
-        for p in lp.findall("./pins/pin"):
-            num  = p.get("num") or ""
-            name = p.get("name") or ""
-            ptype= p.get("type") or ""
-            if num:
+        for p_blk in _iter_blocks(lp_blk, "pin"):
+            m_num  = re.search(r'\(num\s+([^\s\)]+)\)', p_blk)
+            m_name = re.search(r'\(name\s+("[^"]+"|[^\s\)]+)\)', p_blk)
+            m_type = re.search(r'\(type\s+([^\s\)]+)\)', p_blk)
+            if m_num:
+                num  = m_num.group(1).strip('"')
+                name = m_name.group(1).strip('"') if m_name else ""
+                ptype= m_type.group(1) if m_type else ""
                 pins[str(num)] = {"name": name, "type": ptype}
         libpart_pins[(lib,part)] = pins
 
-    # nets with nodes
-    for net in root.findall(".//nets/net"):
-        name = net.get("name") or ""
-        for node in net.findall("./node"):
-            ref = node.get("ref") or ""
-            pin = node.get("pin") or ""
-            if ref and pin:
-                nets[name].add((ref, pin))
-                comp_pins[ref].add(pin)
-                if ref in ref_to_libpart:
-                    key = ref_to_libpart[ref]
-                    pinfo = libpart_pins.get(key, {}).get(str(pin))
-                    if pinfo:
-                        pin_name_map[(ref, str(pin))] = pinfo
+    # nets → nodes (ref/pin)
+    for net_blk in _iter_blocks(text, "net"):
+        m_name = re.search(r'\(name\s+("[^"]+"|[^\s\)]+)\)', net_blk)
+        net_name = m_name.group(1).strip('"') if m_name else ""
+        for node_m in re.finditer(r'\(node\s+\(ref\s+([^\s\)]+)\)\s+\(pin\s+([^\s\)]+)\)\s*\)', net_blk):
+            ref = node_m.group(1); pin = node_m.group(2)
+            nets[net_name].add((ref, pin))
+            comp_pins[ref].add(pin)
+            if ref in ref_to_libpart:
+                pinfo = libpart_pins.get(ref_to_libpart[ref], {}).get(str(pin))
+                if pinfo: pin_name_map[(ref, str(pin))] = pinfo
 
-    return dict(nets), {k: set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
+    return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
 
 def invert_node_to_net(nets: dict[str,set[tuple]]):
     node2net = {}
@@ -111,30 +199,7 @@ def invert_node_to_net(nets: dict[str,set[tuple]]):
             node2net[node] = net_name
     return node2net
 
-# ============================ Type inference from ref/value ============================
-REF_PREFIX = {
-    "R":"Resistor","C":"Capacitor","L":"Inductor","D":"Diode","Z":"Zener",
-    "Q":"MOSFET","T":"BJT","U":"IC","A":"OpAmp","K":"Relay","F":"Fuse",
-    "J":"Connector","X":"Connector",
-}
-def infer_type_from_ref_or_value(ref: str, value: str) -> str:
-    # 1) by ref prefix
-    m = re.match(r'^([A-Za-z]+)', ref or "")
-    if m:
-        pref = m.group(1).upper()
-        for p in sorted(REF_PREFIX, key=lambda x: -len(x)):
-            if pref.startswith(p): return REF_PREFIX[p]
-    # 2) by value hint
-    t = (value or "").lower()
-    if re.search(r'(^|\s)\d+(\.\d+)?(r|k|m)?(\s*ohm|$)', t): return "Resistor"
-    if re.search(r'(^|\s)\d+(\.\d+)?(n|u|µ|p|f)(\s*|$)', t): return "Capacitor"
-    if "opamp" in t: return "OpAmp"
-    if "comp" in t or "comparator" in t: return "Comparator"
-    if "mos" in t or "nmos" in t or "pmos" in t: return "MOSFET"
-    if "diode" in t or t.startswith("1n") or t.startswith("sb"): return "Diode"
-    return "Other"
-
-# ============================ Failure DB parsing & mapping ============================
+# ============================ Failure DB parsing ============================
 def auto_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
     ren = {}
     have_share = any(_norm(c) == "share" for c in df.columns)
@@ -217,7 +282,7 @@ def parse_failure_csv_with_mapping(upload):
         if not parts: return ""
         base = {"resistor","capacitor","capacitor_polarized","inductor","diode","zener",
                 "bjt","mosfet","opamp","comparator","relay","fuse","connector",
-                "voltageregulator","microcontroller","ic"}
+                "voltageregulator","microcontroller","ic","other"}
         for p in parts:
             if _norm(p) in base: return p.capitalize()
         return parts[0]
@@ -345,7 +410,7 @@ def label_rules(row, nets, comp_pins_map, pin_name_map, node2net,
     fm    = (row.get("FailureMode") or "").lower()
 
     if ref not in comp_pins_map:
-        return "UNASSESSED", "Component not present in netlist (should not happen in NET-only mode)"
+        return "UNASSESSED", "Component not in netlist (NET-only mode)"
     if target_net not in nets:
         return "UNASSESSED", f"Target net '{target_net}' not found"
 
@@ -446,7 +511,6 @@ def label_rules(row, nets, comp_pins_map, pin_name_map, node2net,
             return "SAFE", f"No high supply on opposite net ({other})"
         return "NEEDS_REVIEW", "Two-terminal short not on target"
 
-    # Multi-pin fallback
     part_pins = comp_pins_map.get(ref, set())
     part_nets = {net_of(node2net, ref, p) for p in part_pins}
     touches_tgt = target_net in part_nets
@@ -513,11 +577,13 @@ Return strict JSON only:
     except Exception as e:
         return "NEEDS_REVIEW", f"LLM error: {e}"
 
-# ============================ FMEDA expand (NET-only) ============================
+# ============================ FMEDA expansion (NET-only) ============================
 def build_component_table_from_net(comp_pins_map: dict, ref_types: dict) -> pd.DataFrame:
-    # One row per RefDes present in NET, with inferred ComponentType
     rows = []
-    for ref in sorted(comp_pins_map.keys(), key=lambda x: (x[0], int(re.sub(r'[^0-9]', '', x) or 0))):
+    def ref_sort_key(r: str):
+        m = re.search(r'(\d+)$', r)
+        return (re.sub(r'\d+$', '', r), int(m.group(1)) if m else 0)
+    for ref in sorted(comp_pins_map.keys(), key=ref_sort_key):
         rows.append({"RefDes": ref, "ComponentType": ref_types.get(ref, infer_type_from_ref_or_value(ref, ""))})
     df = pd.DataFrame(rows)
     df["ct_norm"] = df["ComponentType"].map(_norm)
@@ -556,33 +622,32 @@ def compute_spfm(fmeda: pd.DataFrame, label_col: str) -> float | None:
     return 1.0 - (lam_spf / lam_total)
 
 # ============================ UI ============================
-st.title("FMEDA — NET-only (KiCad) • Rules vs LLM")
+st.title("FMEDA — KiCad .net (S-expression) • Rules vs LLM")
 
 safety_goal = st.text_input("Safety goal", "Prevent unintended output > 5 V at OUT")
 threshold_v = extract_threshold_from_goal(safety_goal, default=5.0)
 
 c0, c1 = st.columns([1,1])
 with c0:
-    net_file = st.file_uploader("KiCad netlist (.net XML)", type=["net","xml"])
+    net_file = st.file_uploader("Upload KiCad netlist (.net — S-expression or XML)", type=["net","xml"])
 with c1:
-    fail_file = st.file_uploader("Failure Rates & Modes (CSV)", type=["csv"])
+    fail_file = st.file_uploader("Upload Failure Rates & Modes (CSV)", type=["csv"])
 
-use_llm = st.toggle("Run LLM comparison (optional)", value=False, help="Requires OPENAI_API_KEY in Streamlit secrets.")
+use_llm = st.toggle("Run LLM comparison (optional)", value=False, help="Needs OPENAI_API_KEY in secrets.")
 
 if net_file:
     try:
         nets, comp_pins_map, pin_name_map, ref_types = parse_kicad_net(net_file.read())
     except Exception as e:
-        st.error(f"Failed to parse .net: {e}")
+        st.error(f"Failed to parse .net (S-expression/XML): {e}")
         st.stop()
 
     node2net = invert_node_to_net(nets)
-    st.success(f"Parsed NET: {len(nets)} nets • {len(comp_pins_map)} components with pins • {len(pin_name_map)} pin-name entries.")
+    st.success(f"Parsed NET: {len(nets)} nets • {len(comp_pins_map)} components • {len(pin_name_map)} pin-name entries.")
 
-    # Component table from NET only
+    # Build components strictly from NET (no SCH)
     comp_df = build_component_table_from_net(comp_pins_map, ref_types)
-
-    st.subheader("NET components (editable types if needed)")
+    st.subheader("NET components (edit types if needed)")
     comp_df = st.data_editor(
         comp_df[["RefDes","ComponentType","ct_norm"]].rename(columns={"ct_norm":"_norm (read-only)"}),
         disabled=["_norm (read-only)"],
@@ -590,7 +655,7 @@ if net_file:
     )
     comp_df["ct_norm"] = comp_df["ComponentType"].map(_norm)
 
-    # Target net from dropdown
+    # Target net dropdown
     net_names = sorted(nets.keys(), key=lambda x: x.lower())
     default_idx = 0
     for i, n in enumerate(net_names):
@@ -650,14 +715,13 @@ if net_file:
                 fmeda["Reason_llm"] = ""
                 fmeda["Label_diff"] = False
 
-            # Effective FIT (for metrics)
+            # Effective FIT & SPFM
             fmeda["FIT_eff"] = (
                 pd.to_numeric(fmeda["FIT"], errors="coerce").fillna(pd.NA)
                 * pd.to_numeric(fmeda["Share"], errors="coerce").fillna(pd.NA)
                 * (1.0 - pd.to_numeric(fmeda["DC"], errors="coerce").fillna(0.0))
             )
 
-            # Metrics
             spfm_rules = compute_spfm(fmeda, label_col="Label_rules")
             if spfm_rules is not None:
                 st.metric("SPFM (Rules)", f"{spfm_rules*100:.2f}%")
@@ -704,4 +768,4 @@ if net_file:
     else:
         st.info("Upload the Failure Rates & Modes CSV to proceed.")
 else:
-    st.info("Upload a KiCad NET (.net XML) and the Failure DB (CSV) to build the FMEDA.")
+    st.info("Upload a KiCad .net (S-expression/XML) and the Failure DB (CSV) to build FMEDA.")

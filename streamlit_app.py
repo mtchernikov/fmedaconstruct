@@ -35,6 +35,7 @@ for k, v in {
     "target_net": None,
     "comp_df_snapshot": None,
     "fail_df_snapshot": None,
+    "include_hints": False,
 }.items():
     st.session_state.setdefault(k, v)
 
@@ -202,7 +203,7 @@ def parse_kicad_net(net_bytes: bytes):
     ref_types = {ref: infer_type(ref, ref_values.get(ref,"")) for ref in comp_pins.keys()}
     return dict(nets), {k:set(v) for k,v in comp_pins.items()}, pin_name_map, ref_types
 
-def invert_node_to_net(nets: dict[str,set[tuple]]):
+def invert_node_to_net(nets):
     node2net = {}
     for net_name, nodes in nets.items():
         for node in nodes:
@@ -332,7 +333,15 @@ def build_component_table_from_net(comp_pins_map: dict, ref_types: dict) -> pd.D
 
 # ============================ LLM label (goal used verbatim) ============================
 def label_llm(row: pd.Series, safety_goal_text: str, target_net: str,
-              nets, comp_pins_map, pin_name_map, node2net, include_voltage_hints: bool):
+              nets, comp_pins_map, pin_name_map, node2net,
+              include_voltage_hints: bool = False, **kwargs):
+    """
+    include_voltage_hints: set True to pass simple rail hints based on net names.
+    Also accepts legacy alias 'include_hints' via kwargs.
+    """
+    if "include_hints" in kwargs and kwargs["include_hints"] is not None:
+        include_voltage_hints = bool(kwargs["include_hints"])
+
     if OAI is None:
         return "NEEDS_REVIEW", "LLM not configured (set OPENAI_API_KEY)."
 
@@ -634,7 +643,9 @@ st.title("Safety Co-Pilot — FMEDA + Sensitivity (LLM only)")
 
 safety_goal = st.text_input("Safety Goal (verbatim, used as-is by the LLM)",
                             "Prevent unintended >5 V at OUT")
-include_hints = st.toggle("Include voltage hints from net names", value=False, key="include_hints")
+st.session_state["include_hints"] = st.toggle("Include voltage hints from net names",
+                                              value=st.session_state.get("include_hints", False),
+                                              key="include_hints_toggle")
 
 left, right = st.columns([1,1])
 with left:
@@ -663,8 +674,9 @@ if fail_file is not None:
 
 # ---- If we have a net, let user edit types and choose target net ----
 if st.session_state.nets:
-    comp_df = build_component_table_from_net(st.session_state.comp_pins_map, ref_types={r:"Other" for r in st.session_state.comp_pins_map})
-    # Better: infer types once and let user tweak
+    # quick type guess by ref prefix; user can edit
+    comp_df = build_component_table_from_net(st.session_state.comp_pins_map,
+                                             ref_types={r:"Other" for r in st.session_state.comp_pins_map})
     infer_types = []
     for ref in comp_df["RefDes"]:
         infer_types.append(infer_type(ref, ""))
@@ -701,7 +713,6 @@ if st.button("Build FMEDA with LLM", type="primary", use_container_width=True):
     # Merge by normalized ComponentType
     failure_df = st.session_state.fail_df_snapshot.copy()
     fmeda = comp_df.merge(failure_df, how="left", on="ct_norm", suffixes=("_comp","_db"))
-    # prefer ComponentType from comp_df
     if "ComponentType_comp" in fmeda.columns:
         fmeda = fmeda.rename(columns={"ComponentType_comp":"ComponentType"})
     fmeda = fmeda[["RefDes","ComponentType","FailureMode","Share","FIT","DC","Detectable","DiagnosticName"]]
@@ -735,7 +746,11 @@ if st.button("Build FMEDA with LLM", type="primary", use_container_width=True):
     prog = st.progress(0.0, text="Classifying with LLM…")
     total = len(fmeda)
     for idx, (_, row) in enumerate(fmeda.iterrows(), start=1):
-        lab, rsn = label_llm(row, safety_goal, selected_target, nets, comp_pins_map, pin_name_map, node2net, include_hints=st.session_state.get("include_hints", False))
+        lab, rsn = label_llm(
+            row, safety_goal, selected_target,
+            nets, comp_pins_map, pin_name_map, node2net,
+            include_voltage_hints=st.session_state.get("include_hints", False)
+        )
         labels.append(lab); reasons.append(rsn)
         prog.progress(idx/total, text=f"Classifying with LLM… {idx}/{total}")
         time.sleep(0.01)

@@ -6,7 +6,7 @@ from collections import defaultdict
 
 # ============================ App config ============================
 st.set_page_config(page_title="Safety Co-Pilot — FMEDA + Sensitivity (LLM)", layout="wide")
-OPENAI_MODEL = "gpt-5"  # requires OPENAI_API_KEY in Streamlit secrets
+OPENAI_MODEL = "gpt-5-chat-latest"  # requires OPENAI_API_KEY in Streamlit secrets
 
 # Optional OpenAI client
 try:
@@ -990,5 +990,6 @@ Return JSON list of {{"RefDes":"","FailureMode":"","Measures":["..."]}} only."""
 
 else:
     st.info("Upload a KiCad .net and a Failure DB CSV to start.")
+
 
 

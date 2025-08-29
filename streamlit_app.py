@@ -396,7 +396,7 @@ Return STRICT JSON:
             r = OAI.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role":"user","content":prompt}],
-                temperature=0,
+             #   temperature=0,
                 response_format={"type":"json_object"}
             )
             content = r.choices[0].message.content
@@ -990,4 +990,5 @@ Return JSON list of {{"RefDes":"","FailureMode":"","Measures":["..."]}} only."""
 
 else:
     st.info("Upload a KiCad .net and a Failure DB CSV to start.")
+
 
